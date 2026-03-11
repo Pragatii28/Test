@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import json
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request
 import requests
 
 app = Flask(__name__)
@@ -58,6 +58,7 @@ DASHBOARD_HTML = r'''
             --green:#059669; --green-l:#ecfdf5;
             --yellow:#d97706; --yellow-l:#fffbeb;
             --red:#dc2626; --red-l:#fef2f2;
+            --orange:#ea580c; --orange-l:#fff7ed;
             --text:#0f172a; --text2:#334155; --muted:#64748b; --muted2:#94a3b8;
             --sans:'Plus Jakarta Sans',sans-serif; --mono:'JetBrains Mono',monospace;
             --shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);
@@ -87,6 +88,9 @@ DASHBOARD_HTML = r'''
         .nav-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
         .nav-tab .cnt { margin-left:7px; background:var(--bg); color:var(--muted); border-radius:10px; padding:1px 8px; font-size:.68rem; font-weight:700; }
         .nav-tab.active .cnt { background:var(--accent-l); color:var(--accent); }
+        .nav-tab.anomaly-tab.active { color:var(--orange); border-bottom-color:var(--orange); }
+        .nav-tab.anomaly-tab.active .cnt { background:var(--orange-l); color:var(--orange); }
+        .nav-tab.anomaly-tab .cnt.has-data { background:var(--orange-l); color:var(--orange); }
 
         /* ── Layout ── */
         .main { padding:24px 32px 48px; max-width:1600px; margin:0 auto; }
@@ -98,7 +102,7 @@ DASHBOARD_HTML = r'''
         .chip { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:12px 18px; box-shadow:var(--shadow); min-width:120px; }
         .chip .v { font-size:1.6rem; font-weight:800; line-height:1; letter-spacing:-1px; margin-bottom:3px; }
         .chip .l { font-size:.62rem; font-weight:600; letter-spacing:.8px; text-transform:uppercase; color:var(--muted); }
-        .c-blue .v{color:var(--accent)} .c-green .v{color:var(--green)} .c-yellow .v{color:var(--yellow)} .c-red .v{color:var(--red)}
+        .c-blue .v{color:var(--accent)} .c-green .v{color:var(--green)} .c-yellow .v{color:var(--yellow)} .c-red .v{color:var(--red)} .c-orange .v{color:var(--orange)}
 
         /* ── Table ── */
         .table-card { background:var(--surface); border:1px solid var(--border); border-radius:12px; box-shadow:var(--shadow); overflow:hidden; }
@@ -151,6 +155,72 @@ DASHBOARD_HTML = r'''
         .db-stat .k{color:var(--text2);font-weight:500}
         .db-stat .v{color:var(--text);font-weight:700;font-family:var(--mono)}
 
+        /* ── Anomaly panel ── */
+        .an-timeline { display:flex; gap:6px; align-items:flex-end; padding:16px; background:var(--surface2); border-radius:10px; border:1px solid var(--border); margin-bottom:20px; overflow-x:auto; }
+        .an-bar-wrap { display:flex; flex-direction:column; align-items:center; gap:4px; cursor:pointer; min-width:44px; flex-shrink:0; }
+        .an-bar-count { font-size:9px; font-weight:700; font-family:var(--mono); min-height:14px; }
+        .an-bar { width:36px; border-radius:4px; border:2px solid transparent; transition:all .2s; }
+        .an-bar.ok { background:var(--border); min-height:18px; }
+        .an-bar.has-anomaly { background:rgba(234,88,12,.25); border-color:rgba(234,88,12,.4); }
+        .an-bar.selected { border-color:var(--orange) !important; box-shadow:0 0 10px rgba(234,88,12,.35); }
+        .an-bar.ok.selected { background:var(--accent-l); border-color:var(--accent) !important; box-shadow:0 0 10px rgba(37,99,235,.3); }
+        .an-bar-label { font-size:9px; font-family:var(--mono); color:var(--muted); }
+        .an-legend { display:flex; gap:16px; padding:0 4px; }
+        .an-legend-item { display:flex; align-items:center; gap:6px; font-size:10px; color:var(--muted); }
+        .an-legend-dot { width:10px; height:10px; border-radius:2px; }
+
+        .an-detail-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
+        .an-detail-title { font-weight:700; font-size:.9rem; }
+        .an-severity-badge { padding:4px 12px; border-radius:20px; font-size:.7rem; font-weight:700; }
+        .sev-warning { background:var(--yellow-l); color:var(--yellow); }
+        .sev-critical { background:var(--red-l); color:var(--red); }
+
+        .an-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; overflow:hidden; margin-bottom:10px; transition:box-shadow .15s; }
+        .an-card:hover { box-shadow:var(--shadow-md); }
+        .an-card-header { display:flex; align-items:center; gap:12px; padding:14px 16px; cursor:pointer; border-left:3px solid; }
+        .an-card-header.sev-warning { border-left-color:var(--yellow); }
+        .an-card-header.sev-critical { border-left-color:var(--red); }
+        .an-card-icon { width:34px; height:34px; border-radius:8px; display:flex; align-items:center; justify-content:center; font-size:14px; flex-shrink:0; }
+        .an-card-meta { flex:1; min-width:0; }
+        .an-card-name { font-weight:700; font-size:.82rem; color:var(--text); margin-bottom:2px; }
+        .an-card-metric { font-size:.72rem; font-family:var(--mono); color:var(--muted); }
+        .an-card-val { text-align:right; }
+        .an-card-val .cur { font-weight:800; font-size:.9rem; font-family:var(--mono); }
+        .an-card-val .cur.warning { color:var(--yellow); }
+        .an-card-val .cur.critical { color:var(--red); }
+        .an-card-val .lim { font-size:.65rem; color:var(--muted); font-family:var(--mono); }
+        .an-card-chevron { color:var(--muted); transition:transform .2s; margin-left:8px; }
+        .an-card-chevron.open { transform:rotate(180deg); }
+
+        .an-card-body { display:none; padding:14px 16px; border-top:1px solid var(--border); background:var(--surface2); }
+        .an-card-body.open { display:block; }
+        .an-stats-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:14px; }
+        .an-stat { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+        .an-stat .lbl { font-size:.6rem; text-transform:uppercase; letter-spacing:.8px; color:var(--muted); margin-bottom:4px; }
+        .an-stat .val { font-family:var(--mono); font-weight:700; font-size:.82rem; color:var(--text2); }
+
+        .devbar-wrap { margin-bottom:12px; }
+        .devbar-label { font-size:.65rem; text-transform:uppercase; letter-spacing:.8px; color:var(--muted); margin-bottom:6px; }
+        .devbar { position:relative; height:28px; background:#e2e8f0; border-radius:6px; overflow:hidden; }
+        .devbar-normal { position:absolute; top:0; bottom:0; background:rgba(5,150,105,.2); border-left:2px solid var(--green); border-right:2px solid var(--green); }
+        .devbar-marker { position:absolute; top:15%; bottom:15%; width:3px; border-radius:2px; transition:left .6s ease; }
+        .devbar-marker.warning { background:var(--yellow); box-shadow:0 0 6px var(--yellow); }
+        .devbar-marker.critical { background:var(--red); box-shadow:0 0 6px var(--red); }
+        .devbar-low { position:absolute; left:4px; top:50%; transform:translateY(-50%); font-size:9px; color:var(--muted); font-family:var(--mono); }
+        .devbar-high { position:absolute; right:4px; top:50%; transform:translateY(-50%); font-size:9px; color:var(--muted); font-family:var(--mono); }
+
+        .an-reason { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:10px 12px; font-size:.75rem; color:var(--text2); line-height:1.6; font-family:var(--mono); }
+
+        .an-filters { display:flex; gap:10px; margin-bottom:16px; flex-wrap:wrap; align-items:center; }
+        .an-filter-select { padding:6px 12px; border:1px solid var(--border); border-radius:8px; font-size:.75rem; font-family:var(--sans); color:var(--text2); background:var(--surface); cursor:pointer; }
+        .an-filter-select:focus { outline:none; border-color:var(--accent); }
+        .an-hours-label { font-size:.75rem; color:var(--muted); }
+
+        .an-empty { text-align:center; padding:48px 20px; }
+        .an-empty-icon { font-size:2.5rem; margin-bottom:10px; }
+        .an-empty h3 { font-weight:700; color:var(--green); margin-bottom:6px; }
+        .an-empty p { font-size:.8rem; color:var(--muted); }
+
         ::-webkit-scrollbar{width:6px;height:6px}
         ::-webkit-scrollbar-track{background:var(--bg)}
         ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
@@ -177,6 +247,7 @@ DASHBOARD_HTML = r'''
         <button class="nav-tab" onclick="showTab('rds',this)">RDS <span class="cnt" id="tc-rds">0</span></button>
         <button class="nav-tab" onclick="showTab('lam',this)">Lambda <span class="cnt" id="tc-lam">0</span></button>
         <button class="nav-tab" onclick="showTab('logs',this)">Logs <span class="cnt" id="tc-logs">0</span></button>
+        <button class="nav-tab anomaly-tab" onclick="showTab('anomalies',this)" id="anomaly-tab-btn">🔍 Anomalies <span class="cnt" id="tc-anomalies">0</span></button>
         <button class="nav-tab" onclick="showTab('db',this)">DB Stats <span class="cnt" id="tc-db">✦</span></button>
     </div>
 </div>
@@ -222,6 +293,53 @@ DASHBOARD_HTML = r'''
         <thead><tr><th>Cloud / Region</th><th>Errors + Critical</th><th>Warnings</th><th>Info</th><th>Debug</th><th>Health</th></tr></thead>
         <tbody id="tb-logs"><tr><td colspan="6"><div class="empty sh">Loading logs…</div></td></tr></tbody>
     </table></div>
+</div>
+
+<!-- Anomalies -->
+<div class="tab-panel" id="panel-anomalies">
+    <div class="strip" id="s-anomalies"></div>
+
+    <div class="an-filters">
+        <span class="an-hours-label">Show last:</span>
+        <select class="an-filter-select" id="an-hours" onchange="loadAnomalies()">
+            <option value="1">1 hour</option>
+            <option value="6">6 hours</option>
+            <option value="24" selected>24 hours</option>
+            <option value="72">3 days</option>
+            <option value="168">7 days</option>
+        </select>
+        <select class="an-filter-select" id="an-severity" onchange="loadAnomalies()">
+            <option value="">All severities</option>
+            <option value="critical">Critical only</option>
+            <option value="warning">Warning only</option>
+        </select>
+        <select class="an-filter-select" id="an-rtype" onchange="loadAnomalies()">
+            <option value="">All resource types</option>
+            <option value="ec2">EC2</option>
+            <option value="rds">RDS</option>
+            <option value="lambda">Lambda</option>
+        </select>
+        <button class="xbtn" onclick="loadAnomalies()" style="margin-left:auto">⟳ Refresh</button>
+    </div>
+
+    <!-- Timeline bar chart -->
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 20px;box-shadow:var(--shadow);margin-bottom:20px;">
+        <div style="font-size:.7rem;font-weight:700;letter-spacing:.8px;text-transform:uppercase;color:var(--muted);margin-bottom:4px;">Detection Timeline — click a bar to filter</div>
+        <div style="font-size:.75rem;color:var(--muted2);margin-bottom:12px;" id="an-timeline-subtitle">Loading…</div>
+        <div class="an-timeline" id="an-timeline-chart"></div>
+        <div class="an-legend" style="margin-top:8px;">
+            <div class="an-legend-item"><div class="an-legend-dot" style="background:rgba(234,88,12,.25);border:1px solid rgba(234,88,12,.4)"></div>Has anomalies</div>
+            <div class="an-legend-item"><div class="an-legend-dot" style="background:var(--border)"></div>All normal</div>
+            <div class="an-legend-item"><div class="an-legend-dot" style="background:var(--orange-l);border:1px solid var(--orange)"></div>Selected</div>
+        </div>
+    </div>
+
+    <!-- Anomaly cards -->
+    <div id="an-cards-header" class="an-detail-header" style="display:none;">
+        <span class="an-detail-title" id="an-cards-title"></span>
+        <button class="xbtn" onclick="clearAnFilter()">✕ Show all</button>
+    </div>
+    <div id="an-cards"></div>
 </div>
 
 <!-- DB Stats -->
@@ -346,6 +464,7 @@ function showTab(name,el) {
     document.getElementById('panel-'+name).classList.add('active');
     el.classList.add('active');
     if (name==='db') loadDbStats();
+    if (name==='anomalies') loadAnomalies();
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -398,7 +517,6 @@ function renderRDS(m) {
     const list=mergeResWithDiscovery(m,[G('aws','rds','cpu_utilization_percent'),G('aws','rds','database_connections')],'aws','rds');
     document.getElementById('tc-rds').textContent=list.length;
 
-    // Summary chips
     const cpuVals=list.map(r=>V(m,G('aws','rds','cpu_utilization_percent'),r.id)).filter(v=>v!=null);
     const avgCpu=cpuVals.length?cpuVals.reduce((a,b)=>a+b,0)/cpuVals.length:null;
     const nC=cpuVals.filter(v=>v>85).length;
@@ -426,12 +544,10 @@ function renderRDS(m) {
         const swap = V(m,G('aws','rds','swap_usage_bytes'),r.id);
         const dqd  = V(m,G('aws','rds','disk_queue_depth'),r.id);
         const bb   = V(m,G('aws','rds','burst_balance_percent'),r.id);
-        // Replica lag: NULL on primary instances — that is correct, not a bug
         const lagStd    = V(m,G('aws','rds','replica_lag_seconds'),r.id);
         const lagAurora = V(m,G('aws','rds','replica_lag_aurora_seconds'),r.id);
         const lag = lagStd != null ? lagStd : lagAurora;
 
-        // Health: factor in write IOPS spike and disk queue depth
         const health = cpu==null ? 'unkn'
                      : cpu>85   ? 'crit'
                      : cpu>65   ? 'warn'
@@ -439,12 +555,10 @@ function renderRDS(m) {
                      : 'ok';
         const uid = 'rds'+i;
 
-        // Connections: 0 is valid (no active connections on idle DB)
         const connDisplay = conn==null ? '<span class="mv-na">--</span>'
                           : conn===0   ? '<span class="mv-lo">0</span>'
                           : `<span class="mv">${N(conn,0)}</span>`;
 
-        // Replica lag: primary instances have no replicas → show N/A clearly
         const lagDisplay = lag==null
             ? '<span class="mv-na">N/A (primary)</span>'
             : MV(lag,{hi:30,mid:5,fmt:SC});
@@ -541,6 +655,251 @@ function renderLogs(m) {
     }).join('');
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// ANOMALY TAB
+// ══════════════════════════════════════════════════════════════════════════
+
+let _anFilterTime = null;   // selected time-bucket key for click-filter
+let _anData       = null;   // last fetched data
+
+function fmtTs(ts) {
+    if (!ts) return '--';
+    try {
+        return new Date(ts).toLocaleString(undefined, {
+            year:'numeric', month:'short', day:'numeric',
+            hour:'2-digit', minute:'2-digit', second:'2-digit',
+            hour12: false
+        });
+    } catch { return ts; }
+}
+
+function devBar(current, lower, upper, severity) {
+    const range  = upper - lower;
+    const span   = range * 2.4 || Math.abs(current) * 0.5 || 1;
+    const center = (lower + upper) / 2;
+    const start  = center - span / 2;
+    const lowPct = Math.max(1, ((lower - start) / span) * 100);
+    const hiPct  = Math.min(99, ((upper - start) / span) * 100);
+    const valPct = Math.min(98, Math.max(2, ((current - start) / span) * 100));
+    const nw     = hiPct - lowPct;
+    return `
+    <div class="devbar-wrap">
+        <div class="devbar-label">Deviation from normal range</div>
+        <div class="devbar">
+            <div class="devbar-normal" style="left:${lowPct}%;width:${nw}%"></div>
+            <div class="devbar-marker ${severity}" style="left:${valPct}%"></div>
+            <span class="devbar-low">${(+lower).toFixed(4)}</span>
+            <span class="devbar-high">${(+upper).toFixed(4)}</span>
+        </div>
+    </div>`;
+}
+
+function anCard(a, idx) {
+    const uid  = 'an' + idx;
+    const icon = a.resource_type === 'ec2' ? '⚡' :
+                 a.resource_type === 'rds' ? '🗄' :
+                 a.resource_type === 'lambda' ? 'λ' : '☁';
+    const sevLabel = a.severity === 'critical' ? 'CRITICAL' : 'WARNING';
+    const overPct  = a.upper_bound > 0
+        ? (((+a.current_value - +a.upper_bound) / +a.upper_bound) * 100).toFixed(1)
+        : '--';
+
+    return `
+    <div class="an-card" style="animation-delay:${idx*30}ms">
+        <div class="an-card-header sev-${a.severity}" onclick="toggleAnCard('${uid}')">
+            <div class="an-card-icon" style="background:${a.severity==='critical'?'rgba(220,38,38,.12)':'rgba(217,119,6,.12)'}">
+                ${icon}
+            </div>
+            <div class="an-card-meta">
+                <div class="an-card-name">${a.resource_name} <small style="font-weight:400;color:var(--muted);font-size:.7rem">(${a.resource_type}/${a.region})</small></div>
+                <div class="an-card-metric">${a.metric_name.replace(/_/g,' ')}</div>
+            </div>
+            <div class="an-card-val">
+                <div class="cur ${a.severity}">${(+a.current_value).toFixed(4)} <small style="font-size:.65rem">${a.metric_unit||''}</small></div>
+                <div class="lim">limit: ${(+a.upper_bound).toFixed(4)}</div>
+            </div>
+            <span class="an-severity-badge sev-${a.severity}" style="margin:0 8px;flex-shrink:0">${sevLabel}</span>
+            <span class="an-card-chevron" id="achev-${uid}">▾</span>
+        </div>
+        <div class="an-card-body" id="acb-${uid}">
+            <div class="an-stats-grid">
+                <div class="an-stat"><div class="lbl">Current Value</div><div class="val" style="color:${a.severity==='critical'?'var(--red)':'var(--yellow)'}">${(+a.current_value).toFixed(6)}</div></div>
+                <div class="an-stat"><div class="lbl">Normal Low</div><div class="val">${(+a.lower_bound).toFixed(6)}</div></div>
+                <div class="an-stat"><div class="lbl">Normal High</div><div class="val">${(+a.upper_bound).toFixed(6)}</div></div>
+                <div class="an-stat"><div class="lbl">Avg (baseline)</div><div class="val">${(+a.avg_value).toFixed(6)}</div></div>
+                <div class="an-stat"><div class="lbl">Std Deviation</div><div class="val">${(+a.std_value).toFixed(6)}</div></div>
+                <div class="an-stat"><div class="lbl">Over Limit</div><div class="val" style="color:var(--orange)">+${overPct}%</div></div>
+                <div class="an-stat"><div class="lbl">Data Points</div><div class="val">${a.data_points}</div></div>
+                <div class="an-stat"><div class="lbl">Detected At</div><div class="val" style="font-size:.7rem">${fmtTs(a.detected_at)}</div></div>
+            </div>
+            ${devBar(+a.current_value, +a.lower_bound, +a.upper_bound, a.severity)}
+            <div class="an-reason">${a.reason}</div>
+        </div>
+    </div>`;
+}
+
+function toggleAnCard(uid) {
+    const body = document.getElementById('acb-' + uid);
+    const chev = document.getElementById('achev-' + uid);
+    const open = body.classList.toggle('open');
+    if (chev) chev.style.transform = open ? 'rotate(180deg)' : '';
+}
+
+function clearAnFilter() {
+    _anFilterTime = null;
+    document.getElementById('an-cards-header').style.display = 'none';
+    if (_anData) renderAnomalyTimeline(_anData);
+    if (_anData) renderAnomalyCards(_anData);
+}
+
+// ── Local-timezone timeline bucketing ──────────────────────────────────────
+// All timestamps from the server are UTC (marked with Z).
+// We bucket them here using the browser's local timezone so times match
+// what the user sees on their clock (e.g. IST = UTC+5:30).
+
+function localBucketKey(ms, bucketMin) {
+    // Floor epoch ms to bucket boundary in LOCAL time
+    const d   = new Date(ms);
+    const off  = d.getTimezoneOffset() * 60000;          // ms offset from UTC
+    const local = ms - off;                               // shift to local
+    const floor = Math.floor(local / (bucketMin * 60000)) * (bucketMin * 60000);
+    return floor + off;                                   // back to UTC epoch ms
+}
+
+function fmtLocalHHMM(ms) {
+    const d = new Date(ms);
+    return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+}
+
+function buildLocalTimeline(anomalies, bucketMin) {
+    if (!anomalies.length) return [];
+    const counts = new Map();
+    for (const a of anomalies) {
+        const key = localBucketKey(a.detected_at_ms, bucketMin);
+        counts.set(key, (counts.get(key) || 0) + 1);
+        a._localBucket = key;   // attach for filtering
+    }
+    const keys = [...counts.keys()].sort((x,y)=>x-y);
+    const step  = bucketMin * 60000;
+    const start = keys[0], end = keys[keys.length-1];
+    const result = [];
+    for (let t = start; t <= end; t += step) {
+        result.push({ bucket: t, label: fmtLocalHHMM(t), count: counts.get(t) || 0 });
+    }
+    return result;
+}
+
+function renderAnomalyTimeline(data) {
+    const chart    = document.getElementById('an-timeline-chart');
+    const subtitle = document.getElementById('an-timeline-subtitle');
+    const anomalies = data.anomalies || [];
+
+    if (!anomalies.length) {
+        chart.innerHTML = '<span style="color:var(--muted);font-size:.8rem">No anomalies in this period</span>';
+        subtitle.textContent = 'No anomalies recorded yet';
+        return;
+    }
+
+    const buckets = buildLocalTimeline(anomalies, data.bucket_minutes || 5);
+    const maxCount = Math.max(...buckets.map(b => b.count), 1);
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    subtitle.textContent = `${buckets.length} time buckets · ${data.total} total anomalies · last ${document.getElementById('an-hours').value}h · ${tz}`;
+
+    chart.innerHTML = buckets.map(b => {
+        const hasAnomaly = b.count > 0;
+        const barH = hasAnomaly ? Math.max(24, Math.round((b.count / maxCount) * 80)) : 18;
+        const selected = _anFilterTime === b.bucket;
+        return `
+        <div class="an-bar-wrap" onclick="filterByBucket(${b.bucket})">
+            <div class="an-bar-count" style="color:${hasAnomaly ? 'var(--orange)' : 'transparent'}">${hasAnomaly ? b.count : ''}</div>
+            <div class="an-bar ${hasAnomaly ? 'has-anomaly' : 'ok'} ${selected ? 'selected' : ''}"
+                 style="height:${barH}px" title="${b.label}: ${b.count} anomalies"></div>
+            <div class="an-bar-label">${b.label}</div>
+        </div>`;
+    }).join('');
+}
+
+function filterByBucket(bucketMs) {
+    if (_anFilterTime === bucketMs) {
+        clearAnFilter();
+        return;
+    }
+    _anFilterTime = bucketMs;
+
+    // Re-render timeline to update .selected highlight
+    renderAnomalyTimeline(_anData);
+
+    // Filter anomalies by local bucket
+    const filtered = (_anData.anomalies || []).filter(a => a._localBucket === bucketMs);
+    const header   = document.getElementById('an-cards-header');
+    header.style.display = 'flex';
+    const label = fmtLocalHHMM(bucketMs);
+    document.getElementById('an-cards-title').textContent =
+        `${filtered.length} anomal${filtered.length===1?'y':'ies'} at ${label} (local time)`;
+    const cardsEl = document.getElementById('an-cards');
+    cardsEl.innerHTML = filtered.length
+        ? filtered.map((a, i) => anCard(a, i)).join('')
+        : `<div class="an-empty"><div class="an-empty-icon">✅</div><h3>No anomalies in this period</h3></div>`;
+
+    setTimeout(() => header.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
+}
+
+function renderAnomalyCards(data) {
+    const list = data.anomalies || [];
+    const el   = document.getElementById('an-cards');
+    if (!list.length) {
+        el.innerHTML = `<div class="an-empty">
+            <div class="an-empty-icon">✅</div>
+            <h3>No anomalies detected</h3>
+            <p>All metrics are within normal range for the selected period.<br>
+               Make sure anomaly_detection.py is running alongside main.py.</p>
+        </div>`;
+        return;
+    }
+    el.innerHTML = list.map((a, i) => anCard(a, i)).join('');
+}
+
+async function loadAnomalies() {
+    const hours    = document.getElementById('an-hours').value;
+    const severity = document.getElementById('an-severity').value;
+    const rtype    = document.getElementById('an-rtype').value;
+
+    let url = `/api/anomalies?hours=${hours}`;
+    if (severity) url += `&severity=${severity}`;
+    if (rtype)    url += `&resource_type=${rtype}`;
+
+    try {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(r.statusText);
+        const data = await r.json();
+        _anData = data;
+
+        // Update tab badge
+        const cnt = document.getElementById('tc-anomalies');
+        cnt.textContent = data.total || 0;
+        if (data.total > 0) cnt.classList.add('has-data');
+        else cnt.classList.remove('has-data');
+
+        // Summary chips
+        const crits  = (data.anomalies||[]).filter(a => a.severity==='critical').length;
+        const warns  = (data.anomalies||[]).filter(a => a.severity==='warning').length;
+        const rtypes = [...new Set((data.anomalies||[]).map(a => a.resource_type))].length;
+        document.getElementById('s-anomalies').innerHTML =
+            chip(data.total || 0, 'Total Anomalies', data.total ? 'orange' : 'green') +
+            chip(crits, 'Critical', crits ? 'red' : 'green') +
+            chip(warns, 'Warnings', warns ? 'yellow' : 'green') +
+            chip(rtypes || 0, 'Resource Types Affected', rtypes ? 'orange' : 'green');
+
+        renderAnomalyTimeline(data);
+        if (!_anFilterTime) renderAnomalyCards(data);
+
+    } catch(e) {
+        document.getElementById('an-cards').innerHTML =
+            `<div class="err show">Could not load anomalies: ${e.message}<br>
+             Make sure anomaly_detection.py has run at least once to create the anomalies table.</div>`;
+    }
+}
+
 // ── DB Stats tab ───────────────────────────────────────────────────────────
 async function loadDbStats() {
     try {
@@ -555,13 +914,11 @@ async function loadDbStats() {
 
         let cards = `<div class="db-grid">`;
 
-        // Counts card
         cards += `<div class="db-card"><h3>Row Counts</h3>
             <div class="db-stat"><span class="k">Metrics rows</span><span class="v">${d.metrics_count.toLocaleString()}</span></div>
             <div class="db-stat"><span class="k">Log rows</span><span class="v">${d.logs_count.toLocaleString()}</span></div>
         </div>`;
 
-        // Time range card
         cards += `<div class="db-card"><h3>Time Range</h3>
             <div class="db-stat"><span class="k">Metrics oldest</span><span class="v">${d.metrics_range[0]||'--'}</span></div>
             <div class="db-stat"><span class="k">Metrics newest</span><span class="v">${d.metrics_range[1]||'--'}</span></div>
@@ -569,22 +926,19 @@ async function loadDbStats() {
             <div class="db-stat"><span class="k">Logs newest</span><span class="v">${d.logs_range[1]||'--'}</span></div>
         </div>`;
 
-        // Resources card
         cards += `<div class="db-card"><h3>Resources by Type</h3>`;
         for (const row of d.resources)
             cards += `<div class="db-stat"><span class="k">${row.cloud} / ${row.resource_type}</span><span class="v">${row.cnt}</span></div>`;
         cards += `</div>`;
 
-        // Log levels card
         cards += `<div class="db-card"><h3>Log Levels</h3>`;
         for (const row of d.log_levels)
             cards += `<div class="db-stat"><span class="k">${row.cloud} / ${row.log_level}</span><span class="v">${row.cnt.toLocaleString()}</span></div>`;
         if (!d.log_levels.length) cards += `<div class="db-stat"><span class="k">No log data yet</span><span class="v">--</span></div>`;
         cards += `</div>`;
 
-        cards += `</div>`; // db-grid
+        cards += `</div>`;
 
-        // Latest metrics table
         cards += `<div class="table-card" style="margin-top:16px"><table class="rt">
             <thead><tr><th>Cloud</th><th>Type</th><th>Resource</th><th>Metric</th><th>Value</th><th>Unit</th><th>Collected At</th></tr></thead>
             <tbody>`;
@@ -628,8 +982,17 @@ async function update() {
     }
 }
 
+// Auto-refresh anomaly tab if it is active
+async function updateAll() {
+    await update();
+    const panel = document.getElementById('panel-anomalies');
+    if (panel && panel.classList.contains('active')) {
+        loadAnomalies();
+    }
+}
+
 update();
-setInterval(update, 10000);
+setInterval(updateAll, 10000);
 </script>
 </body>
 </html>
@@ -699,6 +1062,128 @@ def db_stats():
 
     conn.close()
     return jsonify(data)
+
+
+@app.route('/api/anomalies')
+def get_anomalies():
+    """
+    Return anomalies from the anomalies table written by anomaly_detection.py.
+
+    Query params:
+        hours         int   — how many hours back to look (default 24)
+        severity      str   — filter by 'critical' or 'warning' (default: all)
+        resource_type str   — filter by resource type e.g. 'ec2' (default: all)
+        limit         int   — max rows to return (default 200)
+        bucket_minutes int  — size of timeline buckets in minutes (default: auto)
+    """
+    if not os.path.exists(DB_PATH):
+        return jsonify({"error": f"Database not found at {DB_PATH}"}), 404
+
+    hours         = int(request.args.get('hours', 24))
+    severity      = request.args.get('severity', '').strip().lower()
+    resource_type = request.args.get('resource_type', '').strip().lower()
+    limit         = int(request.args.get('limit', 200))
+
+    # Auto bucket size: keep ≈ 24–48 bars in the timeline
+    if hours <= 2:
+        bucket_minutes = 5
+    elif hours <= 12:
+        bucket_minutes = 15
+    elif hours <= 48:
+        bucket_minutes = 60
+    else:
+        bucket_minutes = 180
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    # Check the anomalies table exists
+    tbl = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='anomalies'"
+    ).fetchone()
+    if not tbl:
+        conn.close()
+        return jsonify({
+            "error": "anomalies table not found — run anomaly_detection.py first",
+            "anomalies": [], "timeline": [], "total": 0
+        })
+
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+    # Build WHERE clause
+    where  = ["detected_at >= ?"]
+    params = [cutoff]
+    if severity:
+        where.append("severity = ?")
+        params.append(severity)
+    if resource_type:
+        where.append("LOWER(resource_type) = ?")
+        params.append(resource_type)
+
+    where_sql = " AND ".join(where)
+
+    # Fetch anomaly rows
+    rows = conn.execute(f"""
+        SELECT id, detected_at, cloud, region, resource_type, resource_id,
+               resource_name, metric_name, metric_unit, current_value,
+               avg_value, std_value, upper_bound, lower_bound,
+               severity, reason, data_points, acknowledged
+        FROM   anomalies
+        WHERE  {where_sql}
+        ORDER  BY detected_at DESC
+        LIMIT  ?
+    """, params + [limit]).fetchall()
+
+    anomalies = []
+    for r in rows:
+        d = dict(r)
+        # Ensure timestamp is marked UTC so JS Date() parses correctly into local tz
+        ts = d['detected_at']
+        if not ts.endswith('Z') and '+' not in ts[10:]:
+            ts = ts + 'Z'
+        d['detected_at'] = ts
+        # Send epoch ms — frontend uses this for local-tz bucketing
+        d['detected_at_ms'] = int(
+            datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() * 1000
+        )
+        anomalies.append(d)
+
+    # Timeline is built in the frontend using browser local timezone.
+    timeline = []
+
+    # Summary by resource
+    resource_summary: dict = {}
+    for a in anomalies:
+        key = a['resource_id']
+        if key not in resource_summary:
+            resource_summary[key] = {
+                "resource_id":   a['resource_id'],
+                "resource_name": a['resource_name'],
+                "resource_type": a['resource_type'],
+                "region":        a['region'],
+                "count":         0,
+                "critical":      0,
+                "warning":       0,
+                "metrics":       set(),
+            }
+        resource_summary[key]['count']  += 1
+        resource_summary[key][a['severity']] += 1
+        resource_summary[key]['metrics'].add(a['metric_name'])
+
+    for v in resource_summary.values():
+        v['metrics'] = list(v['metrics'])
+
+    conn.close()
+
+    return jsonify({
+        "total":            len(anomalies),
+        "hours":            hours,
+        "bucket_minutes":   bucket_minutes,
+        "anomalies":        anomalies,
+        "timeline":         timeline,
+        "resource_summary": list(resource_summary.values()),
+    })
 
 
 # ══════════════════════════════════════════════════════════════════════════════
