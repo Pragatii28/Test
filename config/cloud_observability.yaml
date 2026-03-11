@@ -6,8 +6,8 @@
 clouds:
   aws:
     enabled: true
-    access_key_id: "AKIA334UGWFXWPONCC5G"
-    secret_access_key: "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"
+    access_key_id: ""
+    secret_access_key: ""
     regions:
       - us-east-1
       # - us-west-2
