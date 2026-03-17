@@ -1,0 +1,103 @@
+# config/cloud_observability.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-Cloud Observability Collector — configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+clouds:
+  aws:
+    enabled: true
+    access_key_id: "AKIA334UGWFXWPONCC5G"
+    secret_access_key: "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"
+    regions:
+      - us-east-1
+      # - us-west-2
+      # - eu-west-1
+    resources:
+      - ec2_instances
+      - rds_instances
+      - lambda_functions
+      - dynamodb_tables
+      - elb_load_balancers
+    lookback_minutes: 10
+    logs_lookback_minutes: 15
+    max_log_groups: 20
+    max_log_events_per_group: 50
+
+  azure:
+    enabled: false
+    subscription_id: ""          # or set AZURE_SUBSCRIPTION_ID env var
+    regions:
+      - eastus
+      - westeurope
+    resources:
+      - virtual_machines
+      - function_apps
+      - sql_databases
+      - app_services
+    lookback_minutes: 10
+    logs_lookback_minutes: 15
+    # log_analytics_workspace_id: ""   # required for log collection
+
+  gcp:
+    enabled: false
+    project_id: ""               # or set GCP_PROJECT_ID env var
+    regions:
+      - us-central1
+      - europe-west1
+    resources:
+      - gce_instances
+      - cloud_functions
+      - cloud_run_services
+      - gke_clusters
+    lookback_minutes: 10
+    logs_lookback_minutes: 15
+    max_log_entries: 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Storage backend
+# ─────────────────────────────────────────────────────────────────────────────
+storage:
+
+  # Options: sqlite | postgres | timescaledb
+  backend: sqlite
+
+  # ── SQLite (default, zero dependencies) ───────────────────────────────────
+  sqlite:
+    path: observability_data/metrics.db
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  # Uncomment to use PostgreSQL (pip install psycopg2-binary)
+  # backend: postgres
+  # postgres:
+  #   host:     localhost
+  #   port:     5432
+  #   dbname:   observability
+  #   user:     postgres
+  #   password: secret
+  #   # OR use a single DSN (overrides individual fields):
+  #   # dsn: "postgresql://postgres:secret@localhost:5432/observability"
+
+  # ── TimescaleDB ────────────────────────────────────────────────────────────
+  # Same connection settings as postgres; hypertables are created automatically.
+  # backend: timescaledb
+  # postgres:
+  #   host:     localhost
+  #   port:     5432
+  #   dbname:   observability
+  #   user:     postgres
+  #   password: secret
+
+  # ── Prometheus exporter (always on by default) ────────────────────────────
+  prometheus:
+    enabled: true
+    host: "0.0.0.0"
+    port: 8000
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Collection settings
+# ─────────────────────────────────────────────────────────────────────────────
+collection:
+  parallel_clouds: true
+  max_workers: 8
