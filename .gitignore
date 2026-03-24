@@ -1,2 +1,6 @@
 observability_data/
 *.db
+logs/
+*.log
+observability_data/
+models/*.joblib
