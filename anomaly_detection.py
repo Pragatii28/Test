@@ -2,48 +2,81 @@
 anomaly_detection.py  —  AIOps-grade Multi-Algorithm Detector
                           Single-file-per-algorithm continuous training
 
-Model file layout (exactly 4 files total):
-  models/
-    isoforest.joblib  ← ONE global IsolationForest trained on ALL metrics
-    prophet.joblib    ← ONE dict: {"resource_id::metric_name": Prophet, ...}
-    river.joblib      ← ONE global River HalfSpaceTrees
-    models.meta.json  ← metadata for all three (trained_at, data_size, etc.)
+CHANGELOG:
+  v1-v6: See inline comments.
 
-Why single files?
-  - No file explosion (was: 1 file per resource × metric × algo = hundreds of files)
-  - Atomic replace on retrain (write to .tmp, rename → no corrupt half-writes)
-  - Easy to inspect, backup, or delete
+  v7 FALSE-POSITIVE FIXES (Prophet model drift + negative forecasts):
+    FP-BUG-4  Prophet stale model blowup: PROPHET_MAX_AGE_HOURS → 6h,
+              model-drift eviction when yhat > PROPHET_IMPLAUSIBLE_FACTOR× mean.
+    FP-BUG-5  Negative Prophet forecasts: _clamp_forecast() clamps yhat/bounds to 0
+              for non-negative metrics.
+    FP-BUG-6  IsoForest absolute-value blindness: raised ISOFOREST_MIN_PCT_DEVIATION
+              to 20%, added ISOFOREST_MIN_ABS_DEVIATION gate.
+    FP-BUG-7  Prophet network deviation too sensitive: per-metric PROPHET_MIN_PCT_DEVIATION.
 
-Training strategy per algorithm:
-  IsolationForest  → Global model trained on ALL resources + ALL metrics combined.
-                     Values are normalized per metric_name before training so
-                     cpu_percent (0-100) and latency_seconds (0-0.5) live in the
-                     same feature space without one dominating.
-                     Retrains when >=10% new data OR model age >= 6h.
-                     Old isoforest.joblib is REPLACED entirely.
+  v8 CLAMP DIVISION-BY-ZERO FIXES:
+    NEW-BUG-1 _clamp_forecast() sets yhat=0 when Prophet drifts negative.
+              _detect_prophet() then computed pct_off = current / max(|0|, 1e-9)
+              = current / 1e-9 → astronomically large % (e.g. 337100800000000000%).
+              These fired as CRITICAL even though the real deviation was normal.
+              Fix: _detect_prophet() now uses training_mean as the percentage
+              denominator whenever clamped yhat == 0. A dedicated helper
+              _safe_pct_off() encapsulates the logic cleanly.
 
-  Prophet          → Per-(resource, metric) models stored in a single dict file.
-                     On retrain only the affected key is updated; the rest are kept.
-                     Warm-start: previous changepoints are seeded into the new fit.
-                     Retrains a key when >=20% new data OR >=24h.
-                     prophet.joblib is REPLACED each time (with updated dict inside).
+    NEW-BUG-2 PROPHET_IMPLAUSIBLE_FACTOR=10 was too lenient: freeable_memory
+              forecast jumped to 930M from a ~490M baseline (1.9×), which is
+              clearly wrong but < 10× threshold so eviction never fired.
+              Fix: lowered PROPHET_IMPLAUSIBLE_FACTOR default from 10 → 3.
+              Also added a second eviction condition: evict if
+              |yhat - training_mean| > PROPHET_IMPLAUSIBLE_ABS_FACTOR × training_std
+              (default 5×). This catches absolute drift independently of the
+              mean-ratio check, covering cases where the mean is near zero
+              (ratios blow up) or where mean is large but std is tight.
 
-  River            → One global HalfSpaceTrees. learn_one() runs on every point.
-                     river.joblib is REPLACED after every learn_one call.
+    NEW-BUG-3 swap_usage_bytes policy was "high only" in v7, so the row-14
+              warning (swap 151M, 1.3% above forecast 149M) was correct but
+              the v7 policy would have suppressed low alerts. Kept high-only
+              policy but added explicit note: this is intentional for swap.
 
-  Z-score          → Pure math. No file.
+    CLEANUP   Removed dead _direction_ok() duplicate (was defined twice in v6).
+              Unified all direction checks through _direction_severity().
+
+  v9 MISSED-DETECTION FIXES (100% CPU not detected):
+    MISS-BUG-1  Metric name mismatch: collector may store metrics as
+                "CPUUtilization", "cpu_percent", "cpu_usage_percent" etc.
+                while detector policies key on "cpu_utilization_percent".
+                Hard limits, policies, z-score all silently skip misnamed
+                metrics. Fix: added _METRIC_NAME_ALIASES dict and
+                _normalize_metric_name() applied to every row before
+                the detection pipeline.
+
+    MISS-BUG-2  STALE_THRESHOLD_MINUTES=5 too tight: any SQLite writer lag
+                > 5 min causes get_all_active_metrics() to filter ALL metrics
+                and return an empty list. Increased default to 15 minutes
+                (still env-overridable via STALE_THRESHOLD_MINUTES).
+
+    MISS-BUG-3  No safety-net for extreme CPU: if normalization somehow fails,
+                added _detect_high_cpu_safety_net() as Layer 0 that fires
+                CRITICAL for any metric whose canonical or raw name contains
+                "cpu" and whose value >= CPU_SAFETY_NET_THRESHOLD (default 95).
+
+    MISS-BUG-4  Improved diagnostic logging: run_detection() now logs a sample
+                of the active metric names seen so metric-name mismatches are
+                immediately visible in the log.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import statistics
 import threading
 import time
+import uuid
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -87,60 +120,376 @@ logging.getLogger("prophet").setLevel(logging.ERROR)
 logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
 
 # ── Settings ──────────────────────────────────────────────────────────────────
-SLACK_WEBHOOK  = os.getenv("SLACK_WEBHOOK_URL", "")
-INTERVAL       = int(os.getenv("DETECTOR_INTERVAL",  "60"))
-MODE           = os.getenv("DETECTOR_MODE",           "continuous")
-CONFIG_PATH    = os.getenv("CONFIG_PATH",             "config/cloud_observability.yaml")
-SENSITIVITY    = float(os.getenv("SENSITIVITY",       "2.0"))
-LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS",      "2"))
-MIN_DATAPOINTS = int(os.getenv("MIN_DATA_POINTS",     "15"))
-WARMUP_MINUTES = int(os.getenv("WARMUP_MINUTES",      "10"))
-MODEL_DIR      = os.getenv("MODEL_DIR",               "models")
+SLACK_WEBHOOK           = os.getenv("SLACK_WEBHOOK_URL",           "")
+INTERVAL                = int(os.getenv("DETECTOR_INTERVAL",       "10"))
+MODE                    = os.getenv("DETECTOR_MODE",                "continuous")
+CONFIG_PATH             = os.getenv("CONFIG_PATH",                  "config/cloud_observability.yaml")
+SENSITIVITY             = float(os.getenv("SENSITIVITY",            "2.0"))
+LOOKBACK_HOURS          = int(os.getenv("LOOKBACK_HOURS",           "2"))
+MIN_DATAPOINTS          = int(os.getenv("MIN_DATA_POINTS",          "8"))
+WARMUP_MINUTES          = int(os.getenv("WARMUP_MINUTES",           "3"))
+MODEL_DIR               = os.getenv("MODEL_DIR",                    "models")
+# MISS-BUG-2 fix: increased default from 5 → 15 minutes so SQLite writer
+# lag doesn't silently filter all metrics from detection.
+STALE_THRESHOLD_MINUTES = int(os.getenv("STALE_THRESHOLD_MINUTES",  "15"))
+DEDUP_WINDOW_MINUTES    = int(os.getenv("DEDUP_WINDOW_MINUTES",     "5"))
+DETECTION_WORKERS       = int(os.getenv("DETECTION_WORKERS",        "8"))
 
-# Retrain thresholds
-ISOFOREST_RETRAIN_THRESHOLD = float(os.getenv("ISOFOREST_RETRAIN_THRESHOLD", "0.10"))
-ISOFOREST_WINDOW_HOURS      = int(os.getenv("ISOFOREST_WINDOW_HOURS",        "24"))
-ISOFOREST_MAX_AGE_HOURS     = int(os.getenv("ISOFOREST_MAX_AGE_HOURS",       "6"))
+# MISS-BUG-3 fix: safety-net threshold for raw CPU value (any metric name
+# containing "cpu"). Set to 95 so 100% CPU always fires even if aliases miss.
+CPU_SAFETY_NET_THRESHOLD = float(os.getenv("CPU_SAFETY_NET_THRESHOLD", "95.0"))
 
-PROPHET_RETRAIN_THRESHOLD   = float(os.getenv("PROPHET_RETRAIN_THRESHOLD",   "0.20"))
-PROPHET_WINDOW_HOURS        = int(os.getenv("PROPHET_WINDOW_HOURS",          "168"))
-PROPHET_MAX_AGE_HOURS       = int(os.getenv("PROPHET_MAX_AGE_HOURS",         "24"))
+# IsoForest
+ISOFOREST_RETRAIN_THRESHOLD   = float(os.getenv("ISOFOREST_RETRAIN_THRESHOLD",   "0.10"))
+ISOFOREST_WINDOW_HOURS        = int(os.getenv("ISOFOREST_WINDOW_HOURS",          "24"))
+ISOFOREST_MAX_AGE_HOURS       = int(os.getenv("ISOFOREST_MAX_AGE_HOURS",         "6"))
+ISOFOREST_MIN_PCT_DEVIATION   = float(os.getenv("ISOFOREST_MIN_PCT_DEVIATION",   "20.0"))
+ISOFOREST_MIN_SCORE_THRESHOLD = float(os.getenv("ISOFOREST_MIN_SCORE_THRESHOLD", "-0.70"))
+ISOFOREST_MIN_ABS_DEVIATION   = float(os.getenv("ISOFOREST_MIN_ABS_DEVIATION",   "0.0"))
 
-RIVER_SCORE_THRESHOLD       = float(os.getenv("RIVER_SCORE_THRESHOLD",       "0.7"))
+# Prophet
+PROPHET_RETRAIN_THRESHOLD      = float(os.getenv("PROPHET_RETRAIN_THRESHOLD",      "0.20"))
+PROPHET_WINDOW_HOURS           = int(os.getenv("PROPHET_WINDOW_HOURS",             "168"))
+PROPHET_MAX_AGE_HOURS          = int(os.getenv("PROPHET_MAX_AGE_HOURS",            "6"))
+# NEW-BUG-2 fix: lowered from 10 → 3
+PROPHET_IMPLAUSIBLE_FACTOR     = float(os.getenv("PROPHET_IMPLAUSIBLE_FACTOR",     "3.0"))
+# NEW-BUG-2 fix: also evict if |yhat - mean| > N × std  (0 = disabled)
+PROPHET_IMPLAUSIBLE_ABS_FACTOR = float(os.getenv("PROPHET_IMPLAUSIBLE_ABS_FACTOR", "5.0"))
+
+# Per-metric minimum % deviation from yhat before Prophet fires.
+_PROPHET_MIN_PCT_DEVIATION_DEFAULT: Dict[str, float] = {
+    "network_transmit_bytes_per_sec":  15.0,
+    "network_receive_bytes_per_sec":   15.0,
+    "network_in_bytes":                15.0,
+    "network_out_bytes":               15.0,
+    "network_packets_in":              15.0,
+    "network_packets_out":             15.0,
+    "cpu_utilization_percent":         10.0,
+    "database_connections":            10.0,
+    "disk_queue_depth":                20.0,
+}
+try:
+    _overrides = json.loads(os.getenv("PROPHET_MIN_PCT_DEVIATION_JSON", "{}"))
+    PROPHET_MIN_PCT_DEVIATION: Dict[str, float] = {
+        **_PROPHET_MIN_PCT_DEVIATION_DEFAULT, **_overrides
+    }
+except Exception:
+    PROPHET_MIN_PCT_DEVIATION = dict(_PROPHET_MIN_PCT_DEVIATION_DEFAULT)
+
+RIVER_SCORE_THRESHOLD = float(os.getenv("RIVER_SCORE_THRESHOLD", "0.65"))
 
 PROPHET_INTERNAL_MIN_ROWS = 20
 ISOFOREST_MIN_MINS        = 30
 ISOFOREST_CONTAMINATION   = 0.01
 STD_FLOOR_PCT             = 0.10
 
+_NO_SUPPRESS_ALGOS: Set[str] = {"hard_limit", "always_bad", "cpu_safety_net"}
+
+# ── MISS-BUG-1 fix: Metric name normalisation ─────────────────────────────────
+# Maps every known collector/provider variant → canonical detector name.
+# Add new entries here whenever a new collector or cloud provider is added.
+_METRIC_NAME_ALIASES: Dict[str, str] = {
+    # CPU
+    "CPUUtilization":                      "cpu_utilization_percent",
+    "cpu_usage_percent":                   "cpu_utilization_percent",
+    "cpu_percent":                         "cpu_utilization_percent",
+    "cpu_usage_idle":                      "cpu_utilization_percent",   # inverted; handled below
+    "node_cpu_seconds_total":              "cpu_utilization_percent",
+    "cpu_utilization":                     "cpu_utilization_percent",
+    "system_cpu_usage":                    "cpu_utilization_percent",
+    "process_cpu_seconds_total":           "cpu_utilization_percent",
+
+    # Memory / freeable
+    "FreeableMemory":                      "freeable_memory_bytes",
+    "freeable_memory":                     "freeable_memory_bytes",
+    "MemoryUtilization":                   "freeable_memory_bytes",
+    "node_memory_MemFree_bytes":           "freeable_memory_bytes",
+    "mem_free":                            "freeable_memory_bytes",
+    "available_memory_bytes":              "freeable_memory_bytes",
+
+    # Free storage
+    "FreeStorageSpace":                    "free_storage_bytes",
+    "free_storage":                        "free_storage_bytes",
+    "disk_free":                           "free_storage_bytes",
+    "node_filesystem_free_bytes":          "free_storage_bytes",
+    "node_filesystem_avail_bytes":         "free_storage_bytes",
+
+    # Burst balance
+    "BurstBalance":                        "burst_balance_percent",
+    "burst_balance":                       "burst_balance_percent",
+
+    # DB connections
+    "DatabaseConnections":                 "database_connections",
+    "db_connections":                      "database_connections",
+    "active_connections":                  "database_connections",
+    "pg_stat_activity_count":             "database_connections",
+
+    # IOPS
+    "ReadIOPS":                            "read_iops",
+    "WriteIOPS":                           "write_iops",
+    "read_ops":                            "read_iops",
+    "write_ops":                           "write_iops",
+    "disk_read_iops":                      "read_iops",
+    "disk_write_iops":                     "write_iops",
+
+    # Latency
+    "ReadLatency":                         "read_latency_seconds",
+    "WriteLatency":                        "write_latency_seconds",
+    "read_latency":                        "read_latency_seconds",
+    "write_latency":                       "write_latency_seconds",
+
+    # Disk queue
+    "DiskQueueDepth":                      "disk_queue_depth",
+    "disk_queue":                          "disk_queue_depth",
+    "io_queue_depth":                      "disk_queue_depth",
+
+    # Network (bytes/sec variants)
+    "NetworkIn":                           "network_in_bytes",
+    "NetworkOut":                          "network_out_bytes",
+    "network_in":                          "network_in_bytes",
+    "network_out":                         "network_out_bytes",
+    "bytes_in":                            "network_in_bytes",
+    "bytes_out":                           "network_out_bytes",
+    "node_network_receive_bytes_total":    "network_receive_bytes_per_sec",
+    "node_network_transmit_bytes_total":   "network_transmit_bytes_per_sec",
+    "NetworkPacketsIn":                    "network_packets_in",
+    "NetworkPacketsOut":                   "network_packets_out",
+
+    # Replica lag
+    "ReplicaLag":                          "replica_lag_seconds",
+    "replica_lag":                         "replica_lag_seconds",
+    "AuroraReplicaLag":                    "replica_lag_aurora_seconds",
+    "aurora_replica_lag":                  "replica_lag_aurora_seconds",
+
+    # Healthy hosts
+    "HealthyHostCount":                    "healthy_host_count",
+    "healthy_hosts":                       "healthy_host_count",
+    "UnHealthyHostCount":                  "unhealthy_host_count",
+    "unhealthy_hosts":                     "unhealthy_host_count",
+
+    # Swap
+    "SwapUsage":                           "swap_usage_bytes",
+    "swap_usage":                          "swap_usage_bytes",
+    "node_memory_SwapFree_bytes":          "swap_usage_bytes",
+
+    # Binlog
+    "BinLogDiskUsage":                     "binlog_disk_usage_bytes",
+    "binlog_disk_usage":                   "binlog_disk_usage_bytes",
+
+    # Lambda / concurrency
+    "ConcurrentExecutions":                "concurrent_executions",
+    "UnreservedConcurrentExecutions":      "unreserved_concurrent_executions",
+    "Invocations":                         "invocations_total",
+    "invocations":                         "invocations_total",
+    "Throttles":                           "throttles_total",
+    "throttles":                           "throttles_total",
+    "Errors":                              "errors_total",
+    "Duration":                            "duration_avg_ms",
+
+    # ALB / response time
+    "TargetResponseTime":                  "target_response_time_s",
+    "RequestCount":                        "request_count",
+    "request_count":                       "request_count",
+    "HTTPCode_Target_5XX_Count":           "http_5xx_count",
+    "http_5xx":                            "http_5xx_count",
+
+    # Status checks
+    "StatusCheckFailed":                   "status_check_failed",
+    "StatusCheckFailed_Instance":          "status_check_failed_instance",
+    "StatusCheckFailed_System":            "status_check_failed_system",
+}
+
+
+def _normalize_metric_name(raw: str) -> str:
+    """
+    MISS-BUG-1 fix: return the canonical metric name for a raw collector name.
+    Falls back to the raw name (lowercased, spaces→underscores) if no alias found.
+    """
+    if raw in _METRIC_NAME_ALIASES:
+        return _METRIC_NAME_ALIASES[raw]
+    # Try case-insensitive match
+    raw_lower = raw.lower()
+    for alias, canonical in _METRIC_NAME_ALIASES.items():
+        if alias.lower() == raw_lower:
+            return canonical
+    # Gentle normalisation: lowercase + underscores
+    return raw_lower.replace(" ", "_").replace("-", "_")
+
+
+def _normalize_row(row: dict) -> dict:
+    """
+    Return a shallow copy of row with metric_name normalised.
+    Also handles inverted metrics (e.g. cpu_usage_idle → 100 - value).
+    """
+    raw_name = row.get("metric_name", "")
+    canonical = _normalize_metric_name(raw_name)
+
+    new_row = dict(row)
+    new_row["metric_name"]     = canonical
+    new_row["_raw_metric_name"] = raw_name   # preserve for logging
+
+    # Special inversion: cpu_usage_idle is (100 - utilisation)
+    if raw_name.lower() in ("cpu_usage_idle", "cpu_idle_percent"):
+        try:
+            new_row["metric_value"] = 100.0 - float(row["metric_value"])
+        except Exception:
+            pass
+
+    return new_row
+
+
+# ── Per-metric physically non-negative ───────────────────────────────────────
+_NON_NEGATIVE_METRICS: Set[str] = {
+    "cpu_utilization_percent", "freeable_memory_bytes", "free_storage_bytes",
+    "burst_balance_percent", "database_connections", "read_iops", "write_iops",
+    "read_latency_seconds", "write_latency_seconds", "disk_queue_depth",
+    "network_in_bytes", "network_out_bytes", "network_packets_in", "network_packets_out",
+    "network_receive_bytes_per_sec", "network_transmit_bytes_per_sec",
+    "replica_lag_seconds", "replica_lag_aurora_seconds", "healthy_host_count",
+    "concurrent_executions", "unreserved_concurrent_executions",
+    "request_count", "invocations_total", "target_response_time_s",
+    "duration_avg_ms", "duration_max_ms", "swap_usage_bytes",
+    "binlog_disk_usage_bytes", "active_connections", "unhealthy_host_count",
+    "http_5xx_count", "throttles_total", "errors_total",
+}
+
+
+def _clamp_forecast(
+    metric_name: str, training_mean: float,
+    yhat: float, yhat_lower: float, yhat_upper: float,
+) -> Tuple[float, float, float]:
+    """Clamp Prophet forecast to >= 0 for non-negative metrics."""
+    if (metric_name in _NON_NEGATIVE_METRICS) or (training_mean >= 0):
+        yhat       = max(0.0, yhat)
+        yhat_lower = max(0.0, yhat_lower)
+        yhat_upper = max(0.0, yhat_upper)
+    return yhat, yhat_lower, yhat_upper
+
+
+def _safe_pct_off(current: float, yhat: float, training_mean: float) -> float:
+    """
+    NEW-BUG-1 fix: compute percentage deviation safely.
+    When yhat has been clamped to 0 use training_mean as reference.
+    """
+    ref = yhat if abs(yhat) >= 1e-6 else training_mean
+    if abs(ref) < 1e-9:
+        return 0.0
+    return abs(current - yhat) / abs(ref) * 100
+
+
+# ── Per-metric directional + severity policy ──────────────────────────────────
+from dataclasses import dataclass as _dc
+
+@_dc
+class _MetricPolicy:
+    alert_high:          bool  = True
+    alert_low:           bool  = True
+    high_severity:       str   = "critical"
+    low_severity:        str   = "critical"
+    low_near_zero_only:  bool  = False
+    low_pct_threshold:   float = 0.0
+
+
+_METRIC_POLICY: Dict[str, _MetricPolicy] = {
+    "network_packets_in":               _MetricPolicy(True,  True,  "critical", "critical", low_near_zero_only=True),
+    "network_packets_out":              _MetricPolicy(True,  True,  "critical", "critical", low_near_zero_only=True),
+    "network_in_bytes":                 _MetricPolicy(True,  True,  "critical", "critical", low_near_zero_only=True),
+    "network_out_bytes":                _MetricPolicy(True,  True,  "critical", "critical", low_near_zero_only=True),
+    "network_receive_bytes_per_sec":    _MetricPolicy(True,  True,  "critical", "critical", low_near_zero_only=True),
+    "network_transmit_bytes_per_sec":   _MetricPolicy(True,  True,  "critical", "critical", low_near_zero_only=True),
+    "cpu_utilization_percent":          _MetricPolicy(True,  True,  "critical", "warning",  low_pct_threshold=70.0),
+    "read_latency_seconds":             _MetricPolicy(True,  False, "critical", "warning"),
+    "write_latency_seconds":            _MetricPolicy(True,  False, "critical", "warning"),
+    "disk_queue_depth":                 _MetricPolicy(True,  False, "critical", "warning"),
+    "duration_avg_ms":                  _MetricPolicy(True,  False, "critical", "warning"),
+    "duration_max_ms":                  _MetricPolicy(True,  False, "critical", "warning"),
+    "target_response_time_s":           _MetricPolicy(True,  False, "critical", "warning"),
+    "replica_lag_seconds":              _MetricPolicy(True,  False, "critical", "warning"),
+    "replica_lag_aurora_seconds":       _MetricPolicy(True,  False, "critical", "warning"),
+    "free_storage_bytes":               _MetricPolicy(False, True,  "warning",  "critical"),
+    "freeable_memory_bytes":            _MetricPolicy(False, True,  "warning",  "critical"),
+    "burst_balance_percent":            _MetricPolicy(False, True,  "warning",  "critical"),
+    "healthy_host_count":               _MetricPolicy(False, True,  "warning",  "critical"),
+    "database_connections":             _MetricPolicy(True,  True,  "critical", "warning",  low_near_zero_only=True),
+    "read_iops":                        _MetricPolicy(True,  True,  "warning",  "warning",  low_near_zero_only=True),
+    "write_iops":                       _MetricPolicy(True,  True,  "warning",  "warning",  low_near_zero_only=True),
+    "concurrent_executions":            _MetricPolicy(True,  False, "critical", "warning"),
+    "unreserved_concurrent_executions": _MetricPolicy(True,  False, "critical", "warning"),
+    "active_connections":               _MetricPolicy(True,  True,  "warning",  "warning",  low_near_zero_only=True),
+    "request_count":                    _MetricPolicy(True,  False, "warning",  "warning"),
+    "binlog_disk_usage_bytes":          _MetricPolicy(True,  False, "warning",  "warning"),
+    "swap_usage_bytes":                 _MetricPolicy(True,  False, "warning",  "warning"),
+}
+
+
+def _get_policy(metric_name: str) -> _MetricPolicy:
+    return _METRIC_POLICY.get(metric_name, _MetricPolicy())
+
+
+def _direction_severity(metric_name: str, current: float, ref: float) -> Optional[str]:
+    policy   = _get_policy(metric_name)
+    going_up = current > ref
+    if going_up:
+        return policy.high_severity if policy.alert_high else None
+    if not policy.alert_low:
+        return None
+    if policy.low_near_zero_only:
+        if current > max(abs(ref) * 0.05, 1e-3):
+            return None
+    if policy.low_pct_threshold > 0.0 and ref > 1e-9:
+        if (ref - current) / ref * 100 < policy.low_pct_threshold:
+            return None
+    return policy.low_severity
+
+
+def _alert_high_ok(metric_name: str) -> bool:
+    return _get_policy(metric_name).alert_high
+
+
+_ONLY_HIGH_IS_BAD: Set[str] = {m for m, p in _METRIC_POLICY.items() if p.alert_high and not p.alert_low}
+_ONLY_LOW_IS_BAD:  Set[str] = {m for m, p in _METRIC_POLICY.items() if p.alert_low  and not p.alert_high}
+
 # ── Detection config sets ─────────────────────────────────────────────────────
 _DEFAULT_ALWAYS_BAD: Set[str] = {
     "status_check_failed", "status_check_failed_instance",
     "status_check_failed_system", "throttles_total", "errors_total",
     "system_errors", "user_errors", "throttled_requests", "unhealthy_host_count",
+    "http_5xx_count", "replica_lag_aurora_seconds",
 }
 _DEFAULT_IGNORE: Set[str] = {
     "disk_read_bytes", "disk_write_bytes", "disk_read_ops",
     "disk_write_ops", "processed_bytes",
 }
 _DEFAULT_METRIC_SENSITIVITY: Dict[str, float] = {
-    "cpu_utilization_percent": 2.5, "database_connections": 2.0,
-    "read_latency_seconds": 2.0,   "write_latency_seconds": 2.0,
-    "duration_avg_ms": 2.5,        "target_response_time_s": 2.0,
-    "free_storage_bytes": 3.0,     "freeable_memory_bytes": 2.5,
-    "request_count": 2.0,          "invocations_total": 2.5,
+    "cpu_utilization_percent": 2.5,  "database_connections": 2.0,
+    "read_latency_seconds": 2.0,     "write_latency_seconds": 2.0,
+    "duration_avg_ms": 2.5,          "target_response_time_s": 2.0,
+    "free_storage_bytes": 3.0,       "freeable_memory_bytes": 2.5,
+    "request_count": 2.0,            "invocations_total": 2.5,
     "network_transmit_bytes_per_sec": 2.5,
-    "network_receive_bytes_per_sec": 2.5,
-    "disk_queue_depth": 2.5,       "read_iops": 2.5, "write_iops": 2.5,
-    "network_in_bytes": 3.5,       "network_out_bytes": 3.5,
-    "network_packets_in": 3.5,     "network_packets_out": 3.5,
-    "concurrent_executions": 2.0,  "unreserved_concurrent_executions": 2.0,
+    "network_receive_bytes_per_sec":  2.5,
+    "disk_queue_depth": 2.5,
+    "read_iops": 2.5,                "write_iops": 2.5,
+    "network_in_bytes": 3.5,         "network_out_bytes": 3.5,
+    "network_packets_in": 3.5,       "network_packets_out": 3.5,
+    "concurrent_executions": 2.0,    "unreserved_concurrent_executions": 2.0,
 }
 _DEFAULT_HARD_LIMITS: Dict[str, Tuple[Optional[float], Optional[float]]] = {
-    "burst_balance_percent":            (10.0, None),
-    "healthy_host_count":               (1.0,  None),
-    "concurrent_executions":            (None, 800.0),
-    "unreserved_concurrent_executions": (None, 800.0),
+    "burst_balance_percent":            (10.0,           None),
+    "healthy_host_count":               (1.0,            None),
+    "concurrent_executions":            (None,           800.0),
+    "unreserved_concurrent_executions": (None,           800.0),
+    "cpu_utilization_percent":          (None,           90.0),
+    "freeable_memory_bytes":            (100_000_000,    None),
+    "free_storage_bytes":               (1_073_741_824,  None),
+    "replica_lag_seconds":              (None,           30.0),
+    "read_latency_seconds":             (None,           1.0),
+    "write_latency_seconds":            (None,           1.0),
+    "disk_queue_depth":                 (None,           10.0),
+    "duration_max_ms":                  (None,           28_000.0),
+    "target_response_time_s":           (None,           5.0),
+    "http_5xx_count":                   (None,           0.5),
+    "database_connections":             (None,           80.0),
 }
 
 ALWAYS_BAD_METRICS: Set[str] = set(_DEFAULT_ALWAYS_BAD)
@@ -156,702 +505,18 @@ def _load_detection_config(config_path: str) -> None:
             cfg = yaml.safe_load(f) or {}
         det = cfg.get("anomaly_detection", {})
         if "always_bad_metrics" in det:
-            ALWAYS_BAD_METRICS = set(det["always_bad_metrics"])
+            ALWAYS_BAD_METRICS = set(_DEFAULT_ALWAYS_BAD) | set(det["always_bad_metrics"])
         if "ignore_metrics" in det:
-            IGNORE_METRICS = set(det["ignore_metrics"])
+            IGNORE_METRICS = set(_DEFAULT_IGNORE) | set(det["ignore_metrics"])
         if "metric_sensitivity" in det:
             METRIC_SENSITIVITY.update(det["metric_sensitivity"])
         if "hard_limits" in det:
             for metric, bounds in det["hard_limits"].items():
                 HARD_LIMITS[metric] = (bounds.get("floor"), bounds.get("ceiling"))
     except FileNotFoundError:
-        log.warning(f"Config not found at {config_path!r} — using built-in defaults.")
+        log.warning(f"Config not found at {config_path!r} — using defaults.")
     except Exception as e:
         log.warning(f"Could not parse config: {e} — using defaults.")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MODEL REGISTRY  —  exactly 3 model files + 1 metadata file
-# ═══════════════════════════════════════════════════════════════════════════════
-class ModelRegistry:
-    """
-    Manages exactly 4 files in MODEL_DIR:
-      isoforest.joblib  — global IsolationForest + per-metric normalization stats
-      prophet.joblib    — dict of {series_key: {model, meta}} for all series
-      river.joblib      — global River HalfSpaceTrees
-      models.meta.json  — training metadata for all three algorithms
-
-    Every save is atomic: write to .tmp first, then rename over the old file.
-    This prevents corrupted reads if the process is killed mid-write.
-    """
-
-    def __init__(self, model_dir: str = MODEL_DIR) -> None:
-        self._dir = Path(model_dir)
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._cache: Dict[str, Any] = {}
-        log.info(f"ModelRegistry: {self._dir.resolve()} (4 files total)")
-
-    # ── File paths ─────────────────────────────────────────────────────────────
-    @property
-    def _iso_path(self)    -> Path: return self._dir / "isoforest.joblib"
-    @property
-    def _prophet_path(self)-> Path: return self._dir / "prophet.joblib"
-    @property
-    def _river_path(self)  -> Path: return self._dir / "river.joblib"
-    @property
-    def _meta_path(self)   -> Path: return self._dir / "models.meta.json"
-
-    # ── Atomic write helper ────────────────────────────────────────────────────
-    def _atomic_save(self, path: Path, obj: Any) -> None:
-        """Write to .tmp then rename — safe against mid-write process kills."""
-        tmp = path.with_suffix(".tmp")
-        try:
-            joblib.dump(obj, tmp, compress=3)
-            shutil.move(str(tmp), str(path))
-        except Exception as e:
-            tmp.unlink(missing_ok=True)
-            raise e
-
-    # ── Metadata ───────────────────────────────────────────────────────────────
-    def _load_meta(self) -> Dict[str, Any]:
-        try:
-            return json.loads(self._meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-
-    def _save_meta(self, meta: Dict[str, Any]) -> None:
-        tmp = self._meta_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        shutil.move(str(tmp), str(self._meta_path))
-
-    def _update_meta(self, algo: str, data_size: int, last_ts: str) -> None:
-        meta = self._load_meta()
-        meta[algo] = {
-            "trained_at": datetime.now(timezone.utc).isoformat(),
-            "data_size":  data_size,
-            "last_ts":    last_ts,
-        }
-        self._save_meta(meta)
-
-    # ── IsolationForest ────────────────────────────────────────────────────────
-    def save_isoforest(
-        self,
-        model: IsolationForest,
-        metric_stats: Dict[str, Dict[str, float]],
-        data_size: int,
-        last_ts: str,
-    ) -> None:
-        """
-        Replace isoforest.joblib entirely with the new global model.
-        metric_stats: per-metric normalization {"cpu_util": {"mean": 45.2, "std": 12.3}}
-        """
-        payload = {"model": model, "metric_stats": metric_stats}
-        self._atomic_save(self._iso_path, payload)
-        self._update_meta("isoforest", data_size, last_ts)
-        self._cache["isoforest"] = payload
-        log.info(f"[Registry] isoforest.joblib REPLACED "
-                 f"({data_size} pts across {len(metric_stats)} metrics)")
-
-    def load_isoforest(self) -> Tuple[Optional[IsolationForest], Dict]:
-        if "isoforest" in self._cache:
-            p = self._cache["isoforest"]
-            return p["model"], p["metric_stats"]
-        if not self._iso_path.exists():
-            return None, {}
-        try:
-            p = joblib.load(self._iso_path)
-            self._cache["isoforest"] = p
-            log.debug("[Registry] Loaded isoforest.joblib from disk")
-            return p["model"], p["metric_stats"]
-        except Exception as e:
-            log.warning(f"[Registry] Corrupt isoforest.joblib: {e} — will retrain")
-            return None, {}
-
-    # ── Prophet ────────────────────────────────────────────────────────────────
-    def save_prophet_series(
-        self,
-        resource_id: str,
-        metric_name: str,
-        model: Any,
-        data_size: int,
-        last_ts: str,
-    ) -> None:
-        """
-        Upsert one series into the prophet dict, then replace prophet.joblib.
-        All other series are preserved untouched.
-        """
-        models_dict = self.load_prophet_all()
-        key = f"{resource_id}::{metric_name}"
-        models_dict[key] = {
-            "model":      model,
-            "trained_at": datetime.now(timezone.utc).isoformat(),
-            "data_size":  data_size,
-            "last_ts":    last_ts,
-        }
-        self._atomic_save(self._prophet_path, models_dict)
-        self._cache["prophet"] = models_dict
-        log.info(f"[Registry] prophet.joblib REPLACED — "
-                 f"updated key={key} ({len(models_dict)} series total)")
-
-    def load_prophet_all(self) -> Dict[str, Any]:
-        if "prophet" in self._cache:
-            return self._cache["prophet"]
-        if not self._prophet_path.exists():
-            return {}
-        try:
-            d = joblib.load(self._prophet_path)
-            self._cache["prophet"] = d
-            log.debug(f"[Registry] Loaded prophet.joblib ({len(d)} series)")
-            return d
-        except Exception as e:
-            log.warning(f"[Registry] Corrupt prophet.joblib: {e} — starting fresh")
-            return {}
-
-    def load_prophet_series(
-        self, resource_id: str, metric_name: str
-    ) -> Tuple[Optional[Any], Optional[Dict]]:
-        key   = f"{resource_id}::{metric_name}"
-        entry = self.load_prophet_all().get(key)
-        if entry is None:
-            return None, None
-        return entry["model"], entry
-
-    # ── River ──────────────────────────────────────────────────────────────────
-    def save_river(self, model: Any, data_size: int, last_ts: str) -> None:
-        """Replace river.joblib with the updated River model."""
-        self._atomic_save(self._river_path, model)
-        self._update_meta("river", data_size, last_ts)
-        self._cache["river"] = model
-
-    def load_river(self) -> Optional[Any]:
-        if "river" in self._cache:
-            return self._cache["river"]
-        if not self._river_path.exists():
-            return None
-        try:
-            m = joblib.load(self._river_path)
-            self._cache["river"] = m
-            log.debug("[Registry] Loaded river.joblib from disk")
-            return m
-        except Exception as e:
-            log.warning(f"[Registry] Corrupt river.joblib: {e} — will create fresh")
-            return None
-
-    # ── Retrain decision ───────────────────────────────────────────────────────
-    def needs_retrain(
-        self,
-        algo: str,
-        current_data_size: int,
-        retrain_threshold: float,
-        max_age_hours: float,
-    ) -> Tuple[bool, str]:
-        """
-        Returns (True, reason) if algo should be retrained, else (False, reason).
-        Reads models.meta.json only — does NOT load the joblib.
-        """
-        meta = self._load_meta().get(algo)
-        if meta is None:
-            return True, "cold start — no saved model"
-
-        try:
-            trained_at = datetime.fromisoformat(meta["trained_at"])
-            age_h = (datetime.now(timezone.utc) - trained_at).total_seconds() / 3600
-        except Exception:
-            return True, "unreadable trained_at"
-
-        if age_h >= max_age_hours:
-            return True, f"age {age_h:.1f}h >= max {max_age_hours}h"
-
-        last_size = meta.get("data_size", 0)
-        if last_size > 0:
-            growth = (current_data_size - last_size) / last_size
-            if growth >= retrain_threshold:
-                return True, f"+{growth*100:.1f}% new data ({last_size} -> {current_data_size})"
-
-        return False, f"fresh ({age_h:.1f}h old)"
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONTINUOUS TRAINER
-# ═══════════════════════════════════════════════════════════════════════════════
-class ContinuousTrainer:
-    """
-    Orchestrates when and how each model retrains.
-
-    IsolationForest: global model, retrained once per cycle if needed.
-    Prophet:         per-series entries in one file, each retrained independently.
-    River:           global model, updated on every single data point.
-    """
-
-    def __init__(self, registry: ModelRegistry) -> None:
-        self.registry = registry
-
-    # ── IsolationForest ────────────────────────────────────────────────────────
-    def maybe_retrain_isoforest(
-        self,
-        all_training_data: Dict[str, List[Tuple[str, float]]],
-    ) -> None:
-        """
-        Called ONCE per detection cycle at the top of run_detection().
-        all_training_data: {"resource_id::metric_name": [(ts, value), ...]}
-
-        Builds one global IsolationForest on all series combined.
-        Normalizes per metric_name so different scales don't dominate.
-        Replaces isoforest.joblib entirely when retrain is triggered.
-        """
-        total_rows = sum(len(v) for v in all_training_data.values())
-        should, reason = self.registry.needs_retrain(
-            "isoforest", total_rows,
-            ISOFOREST_RETRAIN_THRESHOLD, ISOFOREST_MAX_AGE_HOURS,
-        )
-        if not should:
-            log.debug(f"[IsoForest] Skip retrain: {reason}")
-            return
-
-        log.info(f"[IsoForest] Global retrain triggered: {reason} "
-                 f"({total_rows} pts, {len(all_training_data)} series)")
-
-        # Build per-metric normalization stats from all training data
-        metric_values: Dict[str, List[float]] = {}
-        for key, rows in all_training_data.items():
-            metric_name = key.split("::", 1)[1]
-            metric_values.setdefault(metric_name, []).extend(v for _, v in rows)
-
-        metric_stats: Dict[str, Dict[str, float]] = {
-            m: {"mean": float(np.mean(vals)), "std": float(np.std(vals)) or 1.0}
-            for m, vals in metric_values.items()
-        }
-
-        # Build feature matrix: [norm_value, norm_delta, hour_sin, hour_cos, metric_id]
-        metric_id_map = {
-            m: i / max(len(metric_stats), 1)
-            for i, m in enumerate(sorted(metric_stats))
-        }
-        rows_list: List[List[float]] = []
-        for key, history_rows in all_training_data.items():
-            metric_name = key.split("::", 1)[1]
-            st  = metric_stats[metric_name]
-            mid = metric_id_map.get(metric_name, 0.0)
-            vals   = np.array([v for _, v in history_rows])
-            deltas = np.diff(vals, prepend=vals[0])
-            try:
-                hours = np.array([_parse_ts(ts).hour for ts, _ in history_rows], dtype=float)
-            except Exception:
-                hours = np.zeros(len(vals))
-
-            norm_v = (vals - st["mean"]) / st["std"]
-            norm_d = deltas / max(st["std"], 1e-9)
-            h_sin  = np.sin(2 * np.pi * hours / 24)
-            h_cos  = np.cos(2 * np.pi * hours / 24)
-            for i in range(len(vals)):
-                rows_list.append([norm_v[i], norm_d[i], h_sin[i], h_cos[i], mid])
-
-        if len(rows_list) < 10:
-            log.warning("[IsoForest] Not enough data for global retrain")
-            return
-
-        try:
-            clf = IsolationForest(
-                contamination=ISOFOREST_CONTAMINATION,
-                n_estimators=100,
-                random_state=42,
-                n_jobs=-1,
-            )
-            clf.fit(np.array(rows_list))
-            last_ts = max(
-                (rows[-1][0] for rows in all_training_data.values() if rows),
-                default=datetime.now(timezone.utc).isoformat(),
-            )
-            # REPLACE isoforest.joblib
-            self.registry.save_isoforest(clf, metric_stats, total_rows, last_ts)
-        except Exception as e:
-            log.error(f"[IsoForest] Global retrain failed: {e}")
-
-    def score_isoforest(
-        self,
-        metric_name: str,
-        current_value: float,
-        history_rows: List[Tuple[str, float]],
-    ) -> Tuple[int, float]:
-        """Score one value against the global model. Returns (pred, score)."""
-        model, metric_stats = self.registry.load_isoforest()
-        if model is None or metric_name not in metric_stats:
-            return 1, 0.0
-
-        st     = metric_stats[metric_name]
-        prev   = history_rows[-1][1] if history_rows else current_value
-        delta  = current_value - prev
-        hour   = datetime.now(timezone.utc).hour
-        norm_v = (current_value - st["mean"]) / st["std"]
-        norm_d = delta / max(st["std"], 1e-9)
-        X_cur  = np.array([[
-            norm_v, norm_d,
-            np.sin(2 * np.pi * hour / 24),
-            np.cos(2 * np.pi * hour / 24),
-            0.0,
-        ]])
-        try:
-            return int(model.predict(X_cur)[0]), float(model.score_samples(X_cur)[0])
-        except Exception as e:
-            log.debug(f"[IsoForest] score failed for {metric_name}: {e}")
-            return 1, 0.0
-
-    # ── Prophet ────────────────────────────────────────────────────────────────
-    def maybe_retrain_prophet(
-        self,
-        resource_id: str,
-        metric_name: str,
-        history_rows: List[Tuple[str, float]],
-        sens: float,
-    ) -> Optional[Any]:
-        """
-        Return a ready Prophet for this series. Retrains if needed then
-        upserts into prophet.joblib (replacing the file with updated dict).
-        """
-        if not PROPHET_AVAILABLE:
-            return None
-        df = _to_df(history_rows)
-        if len(df) < PROPHET_INTERNAL_MIN_ROWS:
-            return None
-
-        existing_model, existing_meta = self.registry.load_prophet_series(resource_id, metric_name)
-        last_size      = (existing_meta or {}).get("data_size", 0)
-        trained_at_str = (existing_meta or {}).get("trained_at")
-        age_h          = float("inf")
-        if trained_at_str:
-            try:
-                age_h = (
-                    datetime.now(timezone.utc) - datetime.fromisoformat(trained_at_str)
-                ).total_seconds() / 3600
-            except Exception:
-                pass
-
-        growth = (len(df) - last_size) / max(last_size, 1) if last_size else 1.0
-        needs  = (
-            existing_model is None
-            or age_h >= PROPHET_MAX_AGE_HOURS
-            or growth >= PROPHET_RETRAIN_THRESHOLD
-        )
-
-        if not needs:
-            log.debug(f"[Prophet] Reusing {resource_id}::{metric_name} "
-                      f"(age={age_h:.1f}h, +{growth*100:.1f}%)")
-            return existing_model
-
-        # Warm-start: reuse previous changepoints
-        changepoints = None
-        if existing_model is not None:
-            try:
-                changepoints = list(existing_model.changepoints)
-            except Exception:
-                pass
-
-        reason = (
-            "cold start" if existing_model is None
-            else f"age {age_h:.1f}h" if age_h >= PROPHET_MAX_AGE_HOURS
-            else f"+{growth*100:.1f}% new data"
-        )
-        span_h = _span_hours(history_rows)
-        log.info(f"[Prophet] Retraining {resource_id}::{metric_name}: {reason}"
-                 + (" [warm-start]" if changepoints else ""))
-        try:
-            kwargs: Dict[str, Any] = dict(
-                interval_width=min(0.99, 1 - 1 / (sens * 3)),
-                daily_seasonality=span_h >= 24,
-                weekly_seasonality=span_h >= 168,
-                yearly_seasonality=False,
-                changepoint_prior_scale=0.05,
-            )
-            if changepoints:
-                kwargs["changepoints"] = changepoints
-            m = Prophet(**kwargs)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                m.fit(df)
-            # Upsert into dict, then REPLACE prophet.joblib
-            self.registry.save_prophet_series(
-                resource_id, metric_name, m, len(df), history_rows[-1][0]
-            )
-            return m
-        except Exception as e:
-            log.warning(f"[Prophet] Retrain failed {resource_id}::{metric_name}: {e}")
-            return existing_model
-
-    # ── River ──────────────────────────────────────────────────────────────────
-    def get_or_create_river(self) -> Optional[Any]:
-        if not RIVER_AVAILABLE:
-            return None
-        m = self.registry.load_river()
-        if m is None:
-            log.info("[River] Creating new global HalfSpaceTrees model")
-            m = river_anomaly.HalfSpaceTrees(n_trees=25, height=8, window_size=250, seed=42)
-        return m
-
-    def learn_and_score_river(
-        self, model: Any, x: Dict[str, float], data_size: int, last_ts: str,
-    ) -> float:
-        """Score, then learn, then REPLACE river.joblib. Returns 0-1 score."""
-        if not RIVER_AVAILABLE or model is None:
-            return 0.0
-        try:
-            score = model.score_one(x)
-            model.learn_one(x)
-            self.registry.save_river(model, data_size, last_ts)
-            return float(score)
-        except Exception as e:
-            log.debug(f"[River] learn_and_score failed: {e}")
-            return 0.0
-
-
-# ── Data class ────────────────────────────────────────────────────────────────
-@dataclass
-class Anomaly:
-    detected_at: str
-    cloud: str
-    region: str
-    resource_type: str
-    resource_id: str
-    resource_name: str
-    metric_name: str
-    metric_unit: str
-    current_value: float
-    avg_value: float
-    std_value: float
-    upper_bound: float
-    lower_bound: float
-    severity: str
-    reason: str
-    data_points: int
-    algorithm: str = "zscore"
-    correlation_id: str = ""
-
-    @property
-    def deviation(self) -> float:
-        return 0.0 if self.std_value == 0 else abs(self.current_value - self.avg_value) / self.std_value
-
-    def slack_message(self) -> dict:
-        icon = "🔴" if self.severity == "critical" else "🟡"
-        algo_label = {
-            "prophet":          "📈 Prophet",
-            "isolation_forest": "🌲 Isolation Forest",
-            "river":            "🌊 River (online)",
-            "zscore":           "📊 Z-score",
-            "always_bad":       "🚨 Always-bad",
-            "hard_limit":       "🔒 Hard Limit",
-        }.get(self.algorithm, self.algorithm)
-        direction = "▲ ABOVE" if self.current_value > self.upper_bound else "▼ BELOW"
-        return {
-            "text": f"{icon} Anomaly — {self.resource_name} / {self.metric_name}",
-            "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": f"{icon} {self.resource_name}"}},
-                {"type": "section", "fields": [
-                    {"type": "mrkdwn", "text": f"*Resource:*\n{self.resource_name}"},
-                    {"type": "mrkdwn", "text": f"*Metric:*\n{self.metric_name}"},
-                    {"type": "mrkdwn", "text": f"*Severity:*\n{self.severity.upper()}"},
-                    {"type": "mrkdwn", "text": f"*Current:*\n{self.current_value:.4f} {direction}"},
-                    {"type": "mrkdwn", "text": f"*Range:*\n{self.lower_bound:.4f}–{self.upper_bound:.4f}"},
-                    {"type": "mrkdwn", "text": f"*Algorithm:*\n{algo_label}"},
-                ]},
-                {"type": "context", "elements": [{"type": "mrkdwn",
-                    "text": (
-                        f"{self.reason} | {self.data_points} pts | {self.detected_at}"
-                        + (f" | corr:{self.correlation_id}" if self.correlation_id else "")
-                    )}]},
-            ],
-        }
-
-
-# ── Database ──────────────────────────────────────────────────────────────────
-class MetricsReader:
-    _DDL_CREATE = """
-    CREATE TABLE IF NOT EXISTS anomalies (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        detected_at TEXT NOT NULL, cloud TEXT NOT NULL, region TEXT NOT NULL,
-        resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, resource_name TEXT NOT NULL,
-        metric_name TEXT NOT NULL, metric_unit TEXT NOT NULL,
-        current_value REAL NOT NULL, avg_value REAL NOT NULL, std_value REAL NOT NULL,
-        upper_bound REAL NOT NULL, lower_bound REAL NOT NULL,
-        severity TEXT NOT NULL, reason TEXT NOT NULL, data_points INTEGER NOT NULL,
-        acknowledged INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE INDEX IF NOT EXISTS idx_an_time ON anomalies(detected_at DESC);
-    """
-    _DDL_MIGRATE = [
-        ("algorithm",      "TEXT NOT NULL DEFAULT 'zscore'"),
-        ("correlation_id", "TEXT NOT NULL DEFAULT ''"),
-    ]
-
-    def __init__(self, config_path: str) -> None:
-        with open(config_path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-        storage = cfg.get("storage", {})
-        backend = storage.get("backend", "sqlite").lower()
-        self._write_lock = threading.Lock()
-
-        if backend == "sqlite":
-            db_path = storage.get("sqlite", {}).get("path", "observability_data/metrics.db")
-            os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-            self._conn = sqlite3.connect(db_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.executescript(self._DDL_CREATE)
-            existing_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(anomalies)")}
-            for col, defn in self._DDL_MIGRATE:
-                if col not in existing_cols:
-                    self._conn.execute(f"ALTER TABLE anomalies ADD COLUMN {col} {defn}")
-            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_an_corr ON anomalies(correlation_id)")
-            self._conn.commit()
-            self._backend = "sqlite"
-            log.info(f"Connected to SQLite -> {db_path}")
-        else:
-            try:
-                import psycopg2, psycopg2.extras
-                self._psycopg2 = psycopg2
-                self._extras   = psycopg2.extras
-            except ImportError:
-                raise ImportError("pip install psycopg2-binary")
-            pg  = storage.get("postgres", {})
-            dsn = (
-                pg.get("dsn") or os.getenv("DATABASE_URL")
-                or (f"postgresql://{pg.get('user','postgres')}:{pg.get('password','')}@"
-                    f"{pg.get('host','localhost')}:{pg.get('port',5432)}/{pg.get('dbname','observability')}")
-            )
-            self._conn    = psycopg2.connect(dsn)
-            self._backend = "postgres"
-            with self._conn.cursor() as cur:
-                ddl_pg = (
-                    self._DDL_CREATE
-                    .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
-                    .replace("INTEGER NOT NULL DEFAULT 0", "SMALLINT NOT NULL DEFAULT 0")
-                )
-                cur.execute(ddl_pg)
-                cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='anomalies'")
-                existing_pg = {r[0] for r in cur.fetchall()}
-                for col, defn in self._DDL_MIGRATE:
-                    if col not in existing_pg:
-                        cur.execute(f"ALTER TABLE anomalies ADD COLUMN IF NOT EXISTS {col} {defn}")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_an_corr ON anomalies(correlation_id)")
-            self._conn.commit()
-            log.info("Connected to PostgreSQL")
-
-    def get_history(self, resource_id: str, metric_name: str, hours: int = LOOKBACK_HOURS) -> List[Tuple[str, float]]:
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-        if self._backend == "sqlite":
-            rows = self._conn.execute(
-                "SELECT collected_at, metric_value FROM metrics "
-                "WHERE resource_id=? AND metric_name=? AND collected_at>=? ORDER BY collected_at ASC",
-                (resource_id, metric_name, cutoff),
-            ).fetchall()
-        else:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    "SELECT collected_at, metric_value FROM metrics "
-                    "WHERE resource_id=%s AND metric_name=%s AND collected_at>=%s ORDER BY collected_at ASC",
-                    (resource_id, metric_name, cutoff),
-                )
-                rows = cur.fetchall()
-        return [(r[0], float(r[1])) for r in rows]
-
-    def get_all_training_data(self, hours: int) -> Dict[str, List[Tuple[str, float]]]:
-        """
-        Fetch ALL metrics for ALL resources in one DB query.
-        Used for global IsoForest training.
-        Returns {"resource_id::metric_name": [(ts, value), ...]}
-        """
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-        ignore_placeholders = ",".join("?" * len(IGNORE_METRICS)) if IGNORE_METRICS else "'__none__'"
-        if self._backend == "sqlite":
-            rows = self._conn.execute(
-                f"SELECT resource_id, metric_name, collected_at, metric_value "
-                f"FROM metrics WHERE collected_at>=? "
-                f"{'AND metric_name NOT IN (' + ignore_placeholders + ')' if IGNORE_METRICS else ''} "
-                f"ORDER BY resource_id, metric_name, collected_at ASC",
-                (cutoff, *IGNORE_METRICS) if IGNORE_METRICS else (cutoff,),
-            ).fetchall()
-        else:
-            ignore_list = ", ".join(f"'{m}'" for m in IGNORE_METRICS) or "'__none__'"
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT resource_id, metric_name, collected_at, metric_value "
-                    f"FROM metrics WHERE collected_at>=%s "
-                    f"AND metric_name NOT IN ({ignore_list}) "
-                    f"ORDER BY resource_id, metric_name, collected_at ASC",
-                    (cutoff,),
-                )
-                rows = cur.fetchall()
-        result: Dict[str, List[Tuple[str, float]]] = {}
-        for r in rows:
-            result.setdefault(f"{r[0]}::{r[1]}", []).append((r[2], float(r[3])))
-        return result
-
-    def get_all_active_metrics(self) -> List[dict]:
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-        if self._backend == "sqlite":
-            rows = self._conn.execute(
-                "SELECT cloud, region, resource_type, resource_id, resource_name, "
-                "metric_name, metric_unit, metric_value, MAX(collected_at) AS latest_at "
-                "FROM metrics WHERE collected_at>=? GROUP BY resource_id, metric_name "
-                "ORDER BY resource_type, resource_name, metric_name",
-                (cutoff,),
-            ).fetchall()
-        else:
-            with self._conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT DISTINCT ON (resource_id, metric_name) "
-                    "cloud, region, resource_type, resource_id, resource_name, "
-                    "metric_name, metric_unit, metric_value, collected_at AS latest_at "
-                    "FROM metrics WHERE collected_at>=%s "
-                    "ORDER BY resource_id, metric_name, collected_at DESC",
-                    (cutoff,),
-                )
-                rows = cur.fetchall()
-        return [dict(r) for r in rows]
-
-    def recent_anomaly_count(self, resource_id: str, metric_name: str, minutes: int = 30) -> int:
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
-        if self._backend == "sqlite":
-            row = self._conn.execute(
-                "SELECT COUNT(*) FROM anomalies WHERE resource_id=? AND metric_name=? AND detected_at>=?",
-                (resource_id, metric_name, cutoff),
-            ).fetchone()
-        else:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COUNT(*) FROM anomalies WHERE resource_id=%s AND metric_name=%s AND detected_at>=%s",
-                    (resource_id, metric_name, cutoff),
-                )
-                row = cur.fetchone()
-        return int(row[0]) if row else 0
-
-    def save_anomaly(self, a: Anomaly) -> None:
-        vals = (
-            a.detected_at, a.cloud, a.region, a.resource_type, a.resource_id,
-            a.resource_name, a.metric_name, a.metric_unit, a.current_value,
-            a.avg_value, a.std_value, a.upper_bound, a.lower_bound,
-            a.severity, a.reason, a.data_points, a.algorithm, a.correlation_id,
-        )
-        with self._write_lock:
-            if self._backend == "sqlite":
-                self._conn.execute(
-                    "INSERT INTO anomalies "
-                    "(detected_at,cloud,region,resource_type,resource_id,resource_name,"
-                    "metric_name,metric_unit,current_value,avg_value,std_value,"
-                    "upper_bound,lower_bound,severity,reason,data_points,algorithm,correlation_id) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    vals,
-                )
-                self._conn.commit()
-            else:
-                with self._conn.cursor() as cur:
-                    cur.execute(
-                        "INSERT INTO anomalies "
-                        "(detected_at,cloud,region,resource_type,resource_id,resource_name,"
-                        "metric_name,metric_unit,current_value,avg_value,std_value,"
-                        "upper_bound,lower_bound,severity,reason,data_points,algorithm,correlation_id) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                        vals,
-                    )
-                self._conn.commit()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -901,7 +566,828 @@ def _span_hours(history_rows: List[Tuple[str, float]]) -> float:
         return 0.0
 
 
+def _is_stale(latest_at: str) -> bool:
+    try:
+        age_s = (datetime.now(timezone.utc) - _parse_ts(latest_at)).total_seconds()
+        return age_s > STALE_THRESHOLD_MINUTES * 60
+    except Exception:
+        return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODEL REGISTRY
+# ═══════════════════════════════════════════════════════════════════════════════
+class ModelRegistry:
+    def __init__(self, model_dir: str = MODEL_DIR) -> None:
+        self._dir = Path(model_dir)
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._cache: Dict[str, Any] = {}
+        self._prophet_lock    = threading.Lock()
+        self._iso_lock        = threading.Lock()
+        self._river_lock_save = threading.Lock()
+        log.info(f"ModelRegistry: {self._dir.resolve()}")
+
+    @property
+    def _iso_path(self)     -> Path: return self._dir / "isoforest.joblib"
+    @property
+    def _prophet_path(self) -> Path: return self._dir / "prophet.joblib"
+    @property
+    def _river_path(self)   -> Path: return self._dir / "river.joblib"
+    @property
+    def _meta_path(self)    -> Path: return self._dir / "models.meta.json"
+
+    def _atomic_save(self, path: Path, obj: Any) -> None:
+        tmp = path.with_name(f"{path.stem}_{uuid.uuid4().hex}.tmp")
+        try:
+            joblib.dump(obj, tmp, compress=3)
+            tmp.replace(path)
+        except Exception as e:
+            tmp.unlink(missing_ok=True)
+            raise e
+
+    def _load_meta(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self._meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_meta(self, meta: Dict[str, Any]) -> None:
+        tmp = self._meta_path.with_name(f"{self._meta_path.stem}_{uuid.uuid4().hex}.tmp")
+        tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        tmp.replace(self._meta_path)
+
+    def _update_meta(self, algo: str, data_size: int, last_ts: str) -> None:
+        meta = self._load_meta()
+        meta[algo] = {
+            "trained_at": datetime.now(timezone.utc).isoformat(),
+            "data_size":  data_size,
+            "last_ts":    last_ts,
+        }
+        self._save_meta(meta)
+
+    # ── IsolationForest ────────────────────────────────────────────────────────
+    def save_isoforest(
+        self, model: IsolationForest, metric_stats: Dict[str, Dict[str, float]],
+        metric_id_map: Dict[str, float], data_size: int, last_ts: str,
+    ) -> None:
+        payload = {"model": model, "metric_stats": metric_stats, "metric_id_map": metric_id_map}
+        with self._iso_lock:
+            self._atomic_save(self._iso_path, payload)
+            self._update_meta("isoforest", data_size, last_ts)
+            self._cache["isoforest"] = payload
+        log.info(f"[Registry] isoforest saved ({data_size} pts / {len(metric_stats)} metrics)")
+
+    def load_isoforest(self) -> Tuple[Optional[IsolationForest], Dict, Dict]:
+        if "isoforest" in self._cache:
+            p = self._cache["isoforest"]
+            return p["model"], p["metric_stats"], p.get("metric_id_map", {})
+        if not self._iso_path.exists():
+            return None, {}, {}
+        try:
+            p = joblib.load(self._iso_path)
+            self._cache["isoforest"] = p
+            return p["model"], p["metric_stats"], p.get("metric_id_map", {})
+        except Exception as e:
+            log.warning(f"[Registry] Corrupt isoforest: {e}")
+            return None, {}, {}
+
+    # ── Prophet ────────────────────────────────────────────────────────────────
+    def evict_prophet_series(self, resource_id: str, metric_name: str) -> None:
+        key = f"{resource_id}::{metric_name}"
+        with self._prophet_lock:
+            d = self.load_prophet_all()
+            if key in d:
+                del d[key]
+                self._atomic_save(self._prophet_path, d)
+                self._cache["prophet"] = d
+                log.info(f"[Registry] Evicted drifted Prophet: {key}")
+
+    def save_prophet_series(
+        self, resource_id: str, metric_name: str,
+        model: Any, data_size: int, last_ts: str,
+    ) -> None:
+        with self._prophet_lock:
+            d   = self.load_prophet_all()
+            key = f"{resource_id}::{metric_name}"
+            d[key] = {
+                "model": model, "trained_at": datetime.now(timezone.utc).isoformat(),
+                "data_size": data_size, "last_ts": last_ts,
+            }
+            self._atomic_save(self._prophet_path, d)
+            self._cache["prophet"] = d
+        log.info(f"[Registry] prophet saved — {key} ({len(d)} series)")
+
+    def load_prophet_all(self) -> Dict[str, Any]:
+        if "prophet" in self._cache:
+            return copy.deepcopy(self._cache["prophet"])
+        if not self._prophet_path.exists():
+            return {}
+        try:
+            d = joblib.load(self._prophet_path)
+            self._cache["prophet"] = d
+            return copy.deepcopy(d)
+        except Exception as e:
+            log.warning(f"[Registry] Corrupt prophet: {e}")
+            return {}
+
+    def load_prophet_series(
+        self, resource_id: str, metric_name: str
+    ) -> Tuple[Optional[Any], Optional[Dict]]:
+        entry = self.load_prophet_all().get(f"{resource_id}::{metric_name}")
+        return (entry["model"], entry) if entry else (None, None)
+
+    # ── River ──────────────────────────────────────────────────────────────────
+    def save_river(self, model: Any, data_size: int, last_ts: str) -> None:
+        with self._river_lock_save:
+            self._atomic_save(self._river_path, model)
+            self._update_meta("river", data_size, last_ts)
+            self._cache["river"] = model
+
+    def load_river(self) -> Optional[Any]:
+        if "river" in self._cache:
+            return self._cache["river"]
+        if not self._river_path.exists():
+            return None
+        try:
+            m = joblib.load(self._river_path)
+            self._cache["river"] = m
+            return m
+        except Exception as e:
+            log.warning(f"[Registry] Corrupt river: {e}")
+            return None
+
+    def needs_retrain(
+        self, algo: str, current_data_size: int,
+        retrain_threshold: float, max_age_hours: float,
+    ) -> Tuple[bool, str]:
+        meta = self._load_meta().get(algo)
+        if meta is None:
+            return True, "cold start"
+        try:
+            age_h = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(meta["trained_at"])
+            ).total_seconds() / 3600
+        except Exception:
+            return True, "unreadable trained_at"
+        if age_h >= max_age_hours:
+            return True, f"age {age_h:.1f}h >= {max_age_hours}h"
+        last_size = meta.get("data_size", 0)
+        if last_size > 0:
+            growth = (current_data_size - last_size) / last_size
+            if growth >= retrain_threshold:
+                return True, f"+{growth*100:.1f}% new data"
+        return False, f"fresh ({age_h:.1f}h)"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONTINUOUS TRAINER
+# ═══════════════════════════════════════════════════════════════════════════════
+class ContinuousTrainer:
+
+    def __init__(self, registry: ModelRegistry) -> None:
+        self.registry = registry
+        self._river_model: Optional[Any] = None
+        self._river_dirty: bool = False
+        self._river_lock  = threading.Lock()
+
+    # ── IsolationForest ────────────────────────────────────────────────────────
+    def maybe_retrain_isoforest(
+        self, all_training_data: Dict[str, List[Tuple[str, float]]],
+    ) -> None:
+        total_rows = sum(len(v) for v in all_training_data.values())
+        should, reason = self.registry.needs_retrain(
+            "isoforest", total_rows, ISOFOREST_RETRAIN_THRESHOLD, ISOFOREST_MAX_AGE_HOURS,
+        )
+        if not should:
+            log.debug(f"[IsoForest] Skip retrain: {reason}")
+            return
+
+        log.info(f"[IsoForest] Retrain: {reason} ({total_rows} pts, {len(all_training_data)} series)")
+
+        metric_values: Dict[str, List[float]] = {}
+        for key, rows in all_training_data.items():
+            mn = key.split("::", 1)[1]
+            metric_values.setdefault(mn, []).extend(v for _, v in rows)
+
+        metric_stats: Dict[str, Dict[str, float]] = {
+            m: {"mean": float(np.mean(vals)), "std": float(np.std(vals)) or 1.0}
+            for m, vals in metric_values.items()
+        }
+        metric_id_map: Dict[str, float] = {
+            m: i / max(len(metric_stats), 1)
+            for i, m in enumerate(sorted(metric_stats))
+        }
+
+        rows_list: List[List[float]] = []
+        for key, history_rows in all_training_data.items():
+            mn  = key.split("::", 1)[1]
+            st  = metric_stats[mn]
+            mid = metric_id_map.get(mn, 0.0)
+            vals   = np.array([v for _, v in history_rows])
+            deltas = np.diff(vals, prepend=vals[0])
+            try:
+                hours = np.array([_parse_ts(ts).hour for ts, _ in history_rows], dtype=float)
+            except Exception:
+                hours = np.zeros(len(vals))
+            norm_v = (vals   - st["mean"]) / st["std"]
+            norm_d =  deltas / max(st["std"], 1e-9)
+            for i in range(len(vals)):
+                rows_list.append([
+                    norm_v[i], norm_d[i],
+                    np.sin(2 * np.pi * hours[i] / 24),
+                    np.cos(2 * np.pi * hours[i] / 24),
+                    mid,
+                ])
+
+        if len(rows_list) < 10:
+            log.warning("[IsoForest] Not enough data for retrain")
+            return
+        try:
+            clf = IsolationForest(
+                contamination=ISOFOREST_CONTAMINATION, n_estimators=100,
+                random_state=42, n_jobs=-1,
+            )
+            clf.fit(np.array(rows_list))
+            last_ts = max(
+                (rows[-1][0] for rows in all_training_data.values() if rows),
+                default=datetime.now(timezone.utc).isoformat(),
+            )
+            self.registry.save_isoforest(clf, metric_stats, metric_id_map, total_rows, last_ts)
+        except Exception as e:
+            log.error(f"[IsoForest] Retrain failed: {e}")
+
+    def score_isoforest(
+        self, metric_name: str, current_value: float,
+        history_rows: List[Tuple[str, float]],
+    ) -> Tuple[int, float]:
+        model, metric_stats, metric_id_map = self.registry.load_isoforest()
+        if model is None or metric_name not in metric_stats:
+            return 1, 0.0
+        st     = metric_stats[metric_name]
+        prev   = history_rows[-1][1] if history_rows else current_value
+        delta  = current_value - prev
+        hour   = datetime.now(timezone.utc).hour
+        norm_v = (current_value - st["mean"]) / st["std"]
+        norm_d =  delta / max(st["std"], 1e-9)
+        mid    = metric_id_map.get(metric_name, 0.0)
+        X = np.array([[
+            norm_v, norm_d,
+            np.sin(2 * np.pi * hour / 24),
+            np.cos(2 * np.pi * hour / 24),
+            mid,
+        ]])
+        try:
+            return int(model.predict(X)[0]), float(model.score_samples(X)[0])
+        except Exception as e:
+            log.debug(f"[IsoForest] score failed {metric_name}: {e}")
+            return 1, 0.0
+
+    # ── Prophet ────────────────────────────────────────────────────────────────
+    def maybe_retrain_prophet(
+        self, resource_id: str, metric_name: str,
+        history_rows: List[Tuple[str, float]], sens: float,
+    ) -> Optional[Any]:
+        if not PROPHET_AVAILABLE:
+            return None
+        df = _to_df(history_rows)
+        if len(df) < PROPHET_INTERNAL_MIN_ROWS:
+            return None
+
+        existing_model, existing_meta = self.registry.load_prophet_series(resource_id, metric_name)
+        last_size      = (existing_meta or {}).get("data_size", 0)
+        trained_at_str = (existing_meta or {}).get("trained_at")
+        age_h          = float("inf")
+        if trained_at_str:
+            try:
+                age_h = (
+                    datetime.now(timezone.utc) - datetime.fromisoformat(trained_at_str)
+                ).total_seconds() / 3600
+            except Exception:
+                pass
+
+        # NEW-BUG-2 fix: dual eviction gate
+        if existing_model is not None:
+            try:
+                training_mean = float(df["y"].mean())
+                training_std  = float(df["y"].std()) if len(df) > 1 else 0.0
+                now_naive     = datetime.now(timezone.utc).replace(tzinfo=None)
+                fc_check      = existing_model.predict(pd.DataFrame({"ds": [now_naive]}))
+                yhat_check    = float(fc_check["yhat"].iloc[0])
+
+                evict        = False
+                evict_reason = ""
+                if training_mean > 1e-6 and abs(yhat_check) > PROPHET_IMPLAUSIBLE_FACTOR * training_mean:
+                    evict = True
+                    evict_reason = (
+                        f"yhat={yhat_check:.2f} > {PROPHET_IMPLAUSIBLE_FACTOR}× "
+                        f"mean={training_mean:.2f}"
+                    )
+                elif (
+                    PROPHET_IMPLAUSIBLE_ABS_FACTOR > 0
+                    and training_std > 1e-9
+                    and abs(yhat_check - training_mean) > PROPHET_IMPLAUSIBLE_ABS_FACTOR * training_std
+                ):
+                    evict = True
+                    evict_reason = (
+                        f"|yhat-mean|={abs(yhat_check-training_mean):.2f} > "
+                        f"{PROPHET_IMPLAUSIBLE_ABS_FACTOR}× std={training_std:.2f}"
+                    )
+
+                if evict:
+                    log.warning(
+                        f"[Prophet] Drift eviction {resource_id}::{metric_name}: {evict_reason}"
+                    )
+                    self.registry.evict_prophet_series(resource_id, metric_name)
+                    existing_model = None
+                    existing_meta  = None
+            except Exception:
+                pass
+
+        growth = (len(df) - last_size) / max(last_size, 1) if last_size else 1.0
+        needs  = (
+            existing_model is None
+            or age_h >= PROPHET_MAX_AGE_HOURS
+            or growth >= PROPHET_RETRAIN_THRESHOLD
+        )
+        if not needs:
+            return existing_model
+
+        changepoints = None
+        if existing_model is not None:
+            try:
+                changepoints = list(existing_model.changepoints)
+            except Exception:
+                pass
+
+        reason = (
+            "cold start" if existing_model is None
+            else f"age {age_h:.1f}h" if age_h >= PROPHET_MAX_AGE_HOURS
+            else f"+{growth*100:.1f}% new data"
+        )
+        span_h = _span_hours(history_rows)
+        log.info(
+            f"[Prophet] Retraining {resource_id}::{metric_name}: {reason}"
+            + (" [warm-start]" if changepoints else "")
+        )
+        try:
+            kwargs: Dict[str, Any] = dict(
+                interval_width=min(0.99, 1 - 1 / (sens * 3)),
+                daily_seasonality=span_h >= 24,
+                weekly_seasonality=span_h >= 168,
+                yearly_seasonality=False,
+                changepoint_prior_scale=0.05,
+            )
+            if changepoints:
+                kwargs["changepoints"] = changepoints
+            m = Prophet(**kwargs)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                m.fit(df)
+            self.registry.save_prophet_series(
+                resource_id, metric_name, m, len(df), history_rows[-1][0]
+            )
+            return m
+        except Exception as e:
+            log.warning(f"[Prophet] Retrain failed {resource_id}::{metric_name}: {e}")
+            return existing_model
+
+    # ── River ──────────────────────────────────────────────────────────────────
+    def get_or_create_river(self) -> Optional[Any]:
+        if not RIVER_AVAILABLE:
+            return None
+        with self._river_lock:
+            if self._river_model is None:
+                m = self.registry.load_river()
+                if m is None:
+                    log.info("[River] Creating new HalfSpaceTrees model")
+                    m = river_anomaly.HalfSpaceTrees(
+                        n_trees=25, height=8, window_size=250, seed=42
+                    )
+                self._river_model = m
+        return self._river_model
+
+    def learn_and_score_river(
+        self, model: Any, x: Dict[str, float], data_size: int, last_ts: str,
+    ) -> float:
+        if not RIVER_AVAILABLE or model is None:
+            return 0.0
+        try:
+            with self._river_lock:
+                score = model.score_one(x)
+                model.learn_one(x)
+                self._river_dirty = True
+            return float(score)
+        except Exception as e:
+            log.debug(f"[River] score failed: {e}")
+            return 0.0
+
+    def flush_river(self, data_size: int, last_ts: str) -> None:
+        if not RIVER_AVAILABLE or self._river_model is None:
+            return
+        with self._river_lock:
+            if not self._river_dirty:
+                return
+            self.registry.save_river(self._river_model, data_size, last_ts)
+            self._river_dirty = False
+
+
+# ── Data class ────────────────────────────────────────────────────────────────
+@dataclass
+class Anomaly:
+    detected_at:    str
+    cloud:          str
+    region:         str
+    resource_type:  str
+    resource_id:    str
+    resource_name:  str
+    metric_name:    str
+    metric_unit:    str
+    current_value:  float
+    avg_value:      float
+    std_value:      float
+    upper_bound:    float
+    lower_bound:    float
+    severity:       str
+    reason:         str
+    data_points:    int
+    algorithm:      str = "zscore"
+    correlation_id: str = ""
+
+    @property
+    def deviation(self) -> float:
+        if self.algorithm in ("hard_limit", "always_bad", "cpu_safety_net"):
+            return abs(self.current_value - self.avg_value) / max(abs(self.avg_value), 1e-9)
+        return (
+            0.0 if self.std_value == 0
+            else abs(self.current_value - self.avg_value) / self.std_value
+        )
+
+    def slack_message(self) -> dict:
+        icon = "🔴" if self.severity == "critical" else "🟡"
+        algo_label = {
+            "prophet":          "📈 Prophet",
+            "isolation_forest": "🌲 Isolation Forest",
+            "river":            "🌊 River (online)",
+            "zscore":           "📊 Z-score",
+            "always_bad":       "🚨 Always-bad",
+            "hard_limit":       "🔒 Hard Limit",
+            "cpu_safety_net":   "🔥 CPU Safety Net",
+        }.get(self.algorithm, self.algorithm)
+        direction = "▲ ABOVE" if self.current_value > self.upper_bound else "▼ BELOW"
+        return {
+            "text": f"{icon} Anomaly — {self.resource_name} / {self.metric_name}",
+            "blocks": [
+                {"type": "header", "text": {"type": "plain_text", "text": f"{icon} {self.resource_name}"}},
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Resource:*\n{self.resource_name}"},
+                        {"type": "mrkdwn", "text": f"*Metric:*\n{self.metric_name}"},
+                        {"type": "mrkdwn", "text": f"*Severity:*\n{self.severity.upper()}"},
+                        {"type": "mrkdwn", "text": f"*Current:*\n{self.current_value:.4f} {direction}"},
+                        {"type": "mrkdwn", "text": f"*Range:*\n{self.lower_bound:.4f}–{self.upper_bound:.4f}"},
+                        {"type": "mrkdwn", "text": f"*Algorithm:*\n{algo_label}"},
+                    ],
+                },
+                {
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": (
+                        f"{self.reason} | {self.data_points} pts | {self.detected_at}"
+                        + (f" | corr:{self.correlation_id}" if self.correlation_id else "")
+                    )}],
+                },
+            ],
+        }
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
+class MetricsReader:
+    _DDL_CREATE = """
+    CREATE TABLE IF NOT EXISTS anomalies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        detected_at TEXT NOT NULL, cloud TEXT NOT NULL, region TEXT NOT NULL,
+        resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, resource_name TEXT NOT NULL,
+        metric_name TEXT NOT NULL, metric_unit TEXT NOT NULL,
+        current_value REAL NOT NULL, avg_value REAL NOT NULL, std_value REAL NOT NULL,
+        upper_bound REAL NOT NULL, lower_bound REAL NOT NULL,
+        severity TEXT NOT NULL, reason TEXT NOT NULL, data_points INTEGER NOT NULL,
+        acknowledged INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_an_time ON anomalies(detected_at DESC);
+    """
+    _DDL_MIGRATE = [
+        ("algorithm",      "TEXT NOT NULL DEFAULT 'zscore'"),
+        ("correlation_id", "TEXT NOT NULL DEFAULT ''"),
+    ]
+
+    def __init__(self, config_path: str) -> None:
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        storage = cfg.get("storage", {})
+        backend = storage.get("backend", "sqlite").lower()
+        self._write_lock = threading.Lock()
+        self._prev_metric_count: int = 0
+
+        if backend == "sqlite":
+            db_path = storage.get("sqlite", {}).get("path", "observability_data/metrics.db")
+            os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.executescript(self._DDL_CREATE)
+            existing_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(anomalies)")}
+            for col, defn in self._DDL_MIGRATE:
+                if col not in existing_cols:
+                    self._conn.execute(f"ALTER TABLE anomalies ADD COLUMN {col} {defn}")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_an_corr ON anomalies(correlation_id)")
+            self._conn.commit()
+            self._backend = "sqlite"
+            log.info(f"Connected SQLite -> {db_path}")
+        else:
+            try:
+                import psycopg2, psycopg2.extras
+                self._psycopg2 = psycopg2
+                self._extras   = psycopg2.extras
+            except ImportError:
+                raise ImportError("pip install psycopg2-binary")
+            pg  = storage.get("postgres", {})
+            dsn = (
+                pg.get("dsn") or os.getenv("DATABASE_URL")
+                or (
+                    f"postgresql://{pg.get('user','postgres')}:{pg.get('password','')}@"
+                    f"{pg.get('host','localhost')}:{pg.get('port',5432)}"
+                    f"/{pg.get('dbname','observability')}"
+                )
+            )
+            self._conn    = psycopg2.connect(dsn)
+            self._backend = "postgres"
+            with self._conn.cursor() as cur:
+                ddl_pg = (
+                    self._DDL_CREATE
+                    .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+                    .replace("INTEGER NOT NULL DEFAULT 0",        "SMALLINT NOT NULL DEFAULT 0")
+                )
+                cur.execute(ddl_pg)
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name='anomalies'"
+                )
+                existing_pg = {r[0] for r in cur.fetchall()}
+                for col, defn in self._DDL_MIGRATE:
+                    if col not in existing_pg:
+                        cur.execute(f"ALTER TABLE anomalies ADD COLUMN IF NOT EXISTS {col} {defn}")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_an_corr ON anomalies(correlation_id)")
+            self._conn.commit()
+            log.info("Connected PostgreSQL")
+
+    def get_all_active_metrics(self) -> List[dict]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        if self._backend == "sqlite":
+            rows = self._conn.execute(
+                """
+                SELECT m.cloud, m.region, m.resource_type, m.resource_id,
+                       m.resource_name, m.metric_name, m.metric_unit,
+                       m.metric_value, m.collected_at AS latest_at
+                FROM metrics m
+                INNER JOIN (
+                    SELECT resource_id, metric_name, MAX(collected_at) AS max_ts
+                    FROM metrics WHERE collected_at >= ?
+                    GROUP BY resource_id, metric_name
+                ) latest
+                  ON  m.resource_id  = latest.resource_id
+                  AND m.metric_name  = latest.metric_name
+                  AND m.collected_at = latest.max_ts
+                ORDER BY m.resource_type, m.resource_name, m.metric_name
+                """,
+                (cutoff,),
+            ).fetchall()
+        else:
+            with self._conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT DISTINCT ON (resource_id, metric_name) "
+                    "cloud, region, resource_type, resource_id, resource_name, "
+                    "metric_name, metric_unit, metric_value, collected_at AS latest_at "
+                    "FROM metrics WHERE collected_at >= %s "
+                    "ORDER BY resource_id, metric_name, collected_at DESC",
+                    (cutoff,),
+                )
+                rows = cur.fetchall()
+
+        result = [dict(r) for r in rows]
+
+        # MISS-BUG-2: log staleness details so operators can see what's filtered
+        active = []
+        stale_names: List[str] = []
+        for r in result:
+            if _is_stale(r["latest_at"]):
+                stale_names.append(f"{r['resource_name']}/{r['metric_name']}")
+            else:
+                active.append(r)
+
+        if stale_names:
+            log.warning(
+                f"Filtered {len(stale_names)} stale metric(s) "
+                f"(threshold={STALE_THRESHOLD_MINUTES}m). "
+                f"First few: {stale_names[:5]}"
+            )
+
+        current_count = len(active)
+        if self._prev_metric_count > 0:
+            drop_pct = (self._prev_metric_count - current_count) / self._prev_metric_count
+            if drop_pct > 0.5:
+                log.warning(
+                    f"Metric count dropped {drop_pct*100:.0f}%: "
+                    f"{self._prev_metric_count} → {current_count}."
+                )
+        self._prev_metric_count = current_count
+        return active
+
+    def get_all_history_bulk(self, hours: int) -> Dict[str, List[Tuple[str, float]]]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        if self._backend == "sqlite":
+            rows = self._conn.execute(
+                "SELECT resource_id, metric_name, collected_at, metric_value "
+                "FROM metrics WHERE collected_at >= ? "
+                "ORDER BY resource_id, metric_name, collected_at ASC",
+                (cutoff,),
+            ).fetchall()
+        else:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT resource_id, metric_name, collected_at, metric_value "
+                    "FROM metrics WHERE collected_at >= %s "
+                    "ORDER BY resource_id, metric_name, collected_at ASC",
+                    (cutoff,),
+                )
+                rows = cur.fetchall()
+        result: Dict[str, List[Tuple[str, float]]] = {}
+        for r in rows:
+            # MISS-BUG-1: normalise metric names in history bulk too so keys match
+            canonical = _normalize_metric_name(r[1])
+            result.setdefault(f"{r[0]}::{canonical}", []).append((r[2], float(r[3])))
+        return result
+
+    def get_history(
+        self, resource_id: str, metric_name: str, hours: int = LOOKBACK_HOURS
+    ) -> List[Tuple[str, float]]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        canonical = _normalize_metric_name(metric_name)
+        if self._backend == "sqlite":
+            rows = self._conn.execute(
+                "SELECT collected_at, metric_value FROM metrics "
+                "WHERE resource_id = ? AND metric_name IN (?, ?) AND collected_at >= ? "
+                "ORDER BY collected_at ASC",
+                (resource_id, metric_name, canonical, cutoff),
+            ).fetchall()
+        else:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT collected_at, metric_value FROM metrics "
+                    "WHERE resource_id = %s AND metric_name IN (%s, %s) AND collected_at >= %s "
+                    "ORDER BY collected_at ASC",
+                    (resource_id, metric_name, canonical, cutoff),
+                )
+                rows = cur.fetchall()
+        return [(r[0], float(r[1])) for r in rows]
+
+    def get_all_training_data(self, hours: int) -> Dict[str, List[Tuple[str, float]]]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        if self._backend == "sqlite":
+            ph = ",".join("?" * len(IGNORE_METRICS)) if IGNORE_METRICS else "'__none__'"
+            rows = self._conn.execute(
+                f"SELECT resource_id, metric_name, collected_at, metric_value "
+                f"FROM metrics WHERE collected_at >= ? "
+                f"{'AND metric_name NOT IN (' + ph + ')' if IGNORE_METRICS else ''} "
+                f"ORDER BY resource_id, metric_name, collected_at ASC",
+                (cutoff, *IGNORE_METRICS) if IGNORE_METRICS else (cutoff,),
+            ).fetchall()
+        else:
+            with self._conn.cursor() as cur:
+                if IGNORE_METRICS:
+                    ph = ",".join(["%s"] * len(IGNORE_METRICS))
+                    cur.execute(
+                        f"SELECT resource_id, metric_name, collected_at, metric_value "
+                        f"FROM metrics WHERE collected_at >= %s "
+                        f"AND metric_name NOT IN ({ph}) "
+                        f"ORDER BY resource_id, metric_name, collected_at ASC",
+                        (cutoff, *IGNORE_METRICS),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT resource_id, metric_name, collected_at, metric_value "
+                        "FROM metrics WHERE collected_at >= %s "
+                        "ORDER BY resource_id, metric_name, collected_at ASC",
+                        (cutoff,),
+                    )
+                rows = cur.fetchall()
+        result: Dict[str, List[Tuple[str, float]]] = {}
+        for r in rows:
+            # MISS-BUG-1: normalise metric names in training data too
+            canonical = _normalize_metric_name(r[1])
+            result.setdefault(f"{r[0]}::{canonical}", []).append((r[2], float(r[3])))
+        return result
+
+    def recent_anomaly_count(
+        self, resource_id: str, metric_name: str, minutes: int = DEDUP_WINDOW_MINUTES
+    ) -> int:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+        if self._backend == "sqlite":
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM anomalies "
+                "WHERE resource_id = ? AND metric_name = ? AND detected_at >= ?",
+                (resource_id, metric_name, cutoff),
+            ).fetchone()
+        else:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM anomalies "
+                    "WHERE resource_id = %s AND metric_name = %s AND detected_at >= %s",
+                    (resource_id, metric_name, cutoff),
+                )
+                row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def save_anomaly(self, a: Anomaly) -> None:
+        vals = (
+            a.detected_at, a.cloud, a.region, a.resource_type, a.resource_id,
+            a.resource_name, a.metric_name, a.metric_unit, a.current_value,
+            a.avg_value, a.std_value, a.upper_bound, a.lower_bound,
+            a.severity, a.reason, a.data_points, a.algorithm, a.correlation_id,
+        )
+        with self._write_lock:
+            if self._backend == "sqlite":
+                self._conn.execute(
+                    "INSERT INTO anomalies "
+                    "(detected_at,cloud,region,resource_type,resource_id,resource_name,"
+                    "metric_name,metric_unit,current_value,avg_value,std_value,"
+                    "upper_bound,lower_bound,severity,reason,data_points,algorithm,correlation_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    vals,
+                )
+                self._conn.commit()
+            else:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO anomalies "
+                        "(detected_at,cloud,region,resource_type,resource_id,resource_name,"
+                        "metric_name,metric_unit,current_value,avg_value,std_value,"
+                        "upper_bound,lower_bound,severity,reason,data_points,algorithm,correlation_id) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        vals,
+                    )
+                self._conn.commit()
+
+
 # ── Detection layers ──────────────────────────────────────────────────────────
+
+def _detect_high_cpu_safety_net(
+    row: dict, history_rows: List[Tuple[str, float]], now_str: str,
+) -> Optional[Anomaly]:
+    """
+    MISS-BUG-3 fix: Layer 0 safety net.
+
+    If any metric whose name contains "cpu" (raw or canonical) has a value
+    >= CPU_SAFETY_NET_THRESHOLD, fire CRITICAL unconditionally.  This fires
+    even if the metric-name alias lookup produced no canonical match, ensuring
+    100% CPU never slips through silently.
+
+    Uses algorithm="cpu_safety_net" which is in _NO_SUPPRESS_ALGOS so it
+    will not be deduped by the normal 5-minute window.
+    """
+    raw_name = row.get("_raw_metric_name", row.get("metric_name", ""))
+    canonical = row["metric_name"]
+
+    is_cpu = (
+        "cpu" in canonical.lower()
+        or "cpu" in raw_name.lower()
+    )
+    if not is_cpu:
+        return None
+
+    current = float(row["metric_value"])
+    if current < CPU_SAFETY_NET_THRESHOLD:
+        return None
+
+    values = [v for _, v in history_rows]
+    avg    = statistics.mean(values) if values else current
+    std    = statistics.stdev(values) if len(values) > 1 else 0.0
+
+    return Anomaly(
+        detected_at=now_str, cloud=row["cloud"], region=row["region"],
+        resource_type=row["resource_type"], resource_id=row["resource_id"],
+        resource_name=row["resource_name"], metric_name=canonical,
+        metric_unit=row["metric_unit"], current_value=current,
+        avg_value=round(avg, 6), std_value=round(std, 6),
+        upper_bound=round(CPU_SAFETY_NET_THRESHOLD, 6),
+        lower_bound=0.0,
+        severity="critical",
+        reason=(
+            f"[CPU-SafetyNet] {canonical} (raw: {raw_name}) = {current:.2f}% "
+            f">= {CPU_SAFETY_NET_THRESHOLD}% threshold"
+        ),
+        data_points=len(history_rows), algorithm="cpu_safety_net",
+    )
+
+
 def _detect_river(
     row: dict, history_rows: List[Tuple[str, float]],
     sens: float, now_str: str, trainer: ContinuousTrainer,
@@ -911,19 +1397,27 @@ def _detect_river(
     model = trainer.get_or_create_river()
     if model is None:
         return None
+
     current = float(row["metric_value"])
     values  = [v for _, v in history_rows]
     avg     = statistics.mean(values) if values else 0.0
     std     = statistics.stdev(values) if len(values) > 1 else 1e-9
-    x       = {"value": current, "z": (current - avg) / max(std, 1e-9)}
-    score   = trainer.learn_and_score_river(
-        model, x,
+
+    sev = _direction_severity(row["metric_name"], current, avg)
+    if sev is None:
+        return None
+
+    prev  = history_rows[-2][1] if len(history_rows) >= 2 else current
+    delta = current - prev
+    score = trainer.learn_and_score_river(
+        model, {"value": current, "delta": delta},
         data_size=len(history_rows),
         last_ts=history_rows[-1][0] if history_rows else now_str,
     )
     if score >= RIVER_SCORE_THRESHOLD:
         std_floor = max(std, abs(avg) * STD_FLOOR_PCT, 1e-9)
         pct_off   = abs(current - avg) / max(abs(avg), 1e-9) * 100
+        final_sev = "critical" if score > 0.9 else sev
         return Anomaly(
             detected_at=now_str, cloud=row["cloud"], region=row["region"],
             resource_type=row["resource_type"], resource_id=row["resource_id"],
@@ -932,9 +1426,11 @@ def _detect_river(
             avg_value=round(avg, 6), std_value=round(std, 6),
             upper_bound=round(avg + sens * std_floor, 6),
             lower_bound=round(max(0.0, avg - sens * std_floor), 6),
-            severity="critical" if score > 0.9 else "warning",
-            reason=(f"[River/HST] {row['metric_name']} score {score:.3f} "
-                    f">= {RIVER_SCORE_THRESHOLD} ({pct_off:.1f}% from mean {avg:.4f})"),
+            severity=final_sev,
+            reason=(
+                f"[River/HST] {row['metric_name']} score {score:.3f} "
+                f">= {RIVER_SCORE_THRESHOLD} ({pct_off:.1f}% from mean {avg:.4f})"
+            ),
             data_points=len(history_rows), algorithm="river",
         )
     return None
@@ -942,37 +1438,79 @@ def _detect_river(
 
 def _detect_prophet(
     row: dict, history_rows: List[Tuple[str, float]],
-    training_rows: List[Tuple[str, float]],
-    sens: float, now_str: str, trainer: ContinuousTrainer,
+    training_rows: List[Tuple[str, float]], sens: float,
+    now_str: str, trainer: ContinuousTrainer,
 ) -> Optional[Anomaly]:
+    """
+    NEW-BUG-1 fix: percentage deviation computed via _safe_pct_off() which
+    uses training_mean as fallback denominator when yhat has been clamped to 0.
+    """
     m = trainer.maybe_retrain_prophet(row["resource_id"], row["metric_name"], training_rows, sens)
     if m is None:
         return None
     try:
-        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-        forecast  = m.predict(pd.DataFrame({"ds": [now_naive]}))
-        yhat        = float(forecast["yhat"].iloc[0])
-        yhat_lower  = max(0.0, float(forecast["yhat_lower"].iloc[0]))
-        yhat_upper  = float(forecast["yhat_upper"].iloc[0])
+        metric_name = row["metric_name"]
+        now_naive   = datetime.now(timezone.utc).replace(tzinfo=None)
+        forecast    = m.predict(pd.DataFrame({"ds": [now_naive]}))
+
+        df_train     = _to_df(training_rows)
+        training_avg = float(df_train["y"].mean()) if not df_train.empty else 0.0
+        training_std = float(df_train["y"].std())  if len(df_train) > 1  else 0.0
+
+        raw_yhat       = float(forecast["yhat"].iloc[0])
+        raw_yhat_lower = float(forecast["yhat_lower"].iloc[0])
+        raw_yhat_upper = float(forecast["yhat_upper"].iloc[0])
+
+        yhat, yhat_lower, yhat_upper = _clamp_forecast(
+            metric_name, training_avg, raw_yhat, raw_yhat_lower, raw_yhat_upper
+        )
+
         current     = float(row["metric_value"])
-        df          = _to_df(history_rows)
-        avg         = float(df["y"].mean()) if not df.empty else 0.0
-        std         = float(df["y"].std())  if len(df) > 1  else 0.0
-        if current > yhat_upper or current < yhat_lower:
-            direction = "ABOVE" if current > yhat_upper else "BELOW"
-            pct_off   = abs(current - yhat) / max(abs(yhat), 1e-9) * 100
-            return Anomaly(
-                detected_at=now_str, cloud=row["cloud"], region=row["region"],
-                resource_type=row["resource_type"], resource_id=row["resource_id"],
-                resource_name=row["resource_name"], metric_name=row["metric_name"],
-                metric_unit=row["metric_unit"], current_value=current,
-                avg_value=round(avg, 6), std_value=round(std, 6),
-                upper_bound=round(yhat_upper, 6), lower_bound=round(yhat_lower, 6),
-                severity="critical" if pct_off > 50 else "warning",
-                reason=(f"[Prophet] {row['metric_name']} {current:.4f} — "
-                        f"{pct_off:.1f}% {direction} forecast {yhat:.4f}"),
-                data_points=len(df), algorithm="prophet",
+        above_upper = current > yhat_upper
+        below_lower = current < yhat_lower
+
+        if not (above_upper or below_lower):
+            return None
+
+        # NEW-BUG-1 fix: safe pct_off using training_avg as fallback denominator
+        pct_off = _safe_pct_off(current, yhat, training_avg)
+
+        # Per-metric minimum % deviation gate
+        min_pct = PROPHET_MIN_PCT_DEVIATION.get(metric_name, 0.0)
+        if pct_off < min_pct:
+            log.debug(
+                f"[Prophet] Suppressed min-pct {metric_name}: {pct_off:.1f}% < {min_pct}%"
             )
+            return None
+
+        sev = _direction_severity(metric_name, current, yhat)
+        if sev is None:
+            log.debug(
+                f"[Prophet] Suppressed by policy {metric_name}: "
+                f"{'ABOVE' if above_upper else 'BELOW'} yhat={yhat:.4f}"
+            )
+            return None
+
+        direction = "ABOVE" if above_upper else "BELOW"
+        if pct_off > 50 and sev == "warning":
+            sev = "critical"
+
+        return Anomaly(
+            detected_at=now_str, cloud=row["cloud"], region=row["region"],
+            resource_type=row["resource_type"], resource_id=row["resource_id"],
+            resource_name=row["resource_name"], metric_name=metric_name,
+            metric_unit=row["metric_unit"], current_value=current,
+            avg_value=round(training_avg, 6), std_value=round(training_std, 6),
+            upper_bound=round(yhat_upper, 6),
+            lower_bound=round(yhat_lower, 6),
+            severity=sev,
+            reason=(
+                f"[Prophet] {metric_name} {current:.4f} — "
+                f"{pct_off:.1f}% {direction} forecast {yhat:.4f} "
+                f"(168h avg {training_avg:.4f})"
+            ),
+            data_points=len(df_train), algorithm="prophet",
+        )
     except Exception as e:
         log.debug(f"[Prophet] predict failed {row['resource_name']}/{row['metric_name']}: {e}")
     return None
@@ -982,15 +1520,34 @@ def _detect_isoforest(
     row: dict, history_rows: List[Tuple[str, float]],
     sens: float, now_str: str, trainer: ContinuousTrainer,
 ) -> Optional[Anomaly]:
-    current    = float(row["metric_value"])
+    current     = float(row["metric_value"])
     pred, score = trainer.score_isoforest(row["metric_name"], current, history_rows)
     if pred != -1:
         return None
+
     values    = [v for _, v in history_rows]
     avg       = statistics.mean(values) if values else 0.0
     std       = statistics.stdev(values) if len(values) > 1 else 0.0
     std_floor = max(std, abs(avg) * STD_FLOOR_PCT, 1e-9)
     pct_off   = abs(current - avg) / max(abs(avg), 1e-9) * 100
+    abs_off   = abs(current - avg)
+
+    if pct_off < ISOFOREST_MIN_PCT_DEVIATION:
+        log.debug(f"[IsoForest] Suppressed pct {row['metric_name']}: {pct_off:.1f}%")
+        return None
+    if score > ISOFOREST_MIN_SCORE_THRESHOLD:
+        log.debug(f"[IsoForest] Suppressed score {row['metric_name']}: {score:.3f}")
+        return None
+    if ISOFOREST_MIN_ABS_DEVIATION > 0.0 and abs_off < ISOFOREST_MIN_ABS_DEVIATION:
+        log.debug(f"[IsoForest] Suppressed abs {row['metric_name']}: {abs_off:.6f}")
+        return None
+
+    sev = _direction_severity(row["metric_name"], current, avg)
+    if sev is None:
+        return None
+    if pct_off > 50:
+        sev = "critical"
+
     return Anomaly(
         detected_at=now_str, cloud=row["cloud"], region=row["region"],
         resource_type=row["resource_type"], resource_id=row["resource_id"],
@@ -999,9 +1556,11 @@ def _detect_isoforest(
         avg_value=round(avg, 6), std_value=round(std, 6),
         upper_bound=round(avg + sens * std_floor, 6),
         lower_bound=round(max(0.0, avg - sens * std_floor), 6),
-        severity="critical" if pct_off > 50 else "warning",
-        reason=(f"[IsoForest] {row['metric_name']} {current:.4f} — "
-                f"global model flagged outlier (score:{score:.3f}, {pct_off:.1f}% from mean {avg:.4f})"),
+        severity=sev,
+        reason=(
+            f"[IsoForest] {row['metric_name']} {current:.4f} — "
+            f"outlier (score:{score:.3f}, {pct_off:.1f}% from mean {avg:.4f})"
+        ),
         data_points=len(history_rows), algorithm="isolation_forest",
     )
 
@@ -1018,14 +1577,17 @@ def _detect_zscore(
     std = statistics.stdev(values) if len(values) > 1 else 0.0
     if avg < 1e-9 and std < 1e-9:
         if current > 1e-9:
+            if not _alert_high_ok(row["metric_name"]):
+                return None
+            sev = _get_policy(row["metric_name"]).high_severity
             return Anomaly(
                 detected_at=now_str, cloud=row["cloud"], region=row["region"],
                 resource_type=row["resource_type"], resource_id=row["resource_id"],
                 resource_name=row["resource_name"], metric_name=row["metric_name"],
                 metric_unit=row["metric_unit"], current_value=current,
                 avg_value=0.0, std_value=0.0, upper_bound=0.0, lower_bound=0.0,
-                severity="warning",
-                reason=f"[Z-score] {row['metric_name']} was always 0 but is now {current:.4f}",
+                severity=sev,
+                reason=f"[Z-score] {row['metric_name']} was 0 but is now {current:.4f}",
                 data_points=len(values), algorithm="zscore",
             )
         return None
@@ -1033,7 +1595,12 @@ def _detect_zscore(
     upper_bound = avg + sens * std_floor
     lower_bound = max(0.0, avg - sens * std_floor)
     if current > upper_bound or current < lower_bound:
+        sev = _direction_severity(row["metric_name"], current, avg)
+        if sev is None:
+            return None
         deviation = abs(current - avg) / std_floor
+        if deviation > sens * 1.5:
+            sev = "critical"
         direction = "ABOVE" if current > upper_bound else "BELOW"
         return Anomaly(
             detected_at=now_str, cloud=row["cloud"], region=row["region"],
@@ -1042,9 +1609,11 @@ def _detect_zscore(
             metric_unit=row["metric_unit"], current_value=current,
             avg_value=round(avg, 6), std_value=round(std, 6),
             upper_bound=round(upper_bound, 6), lower_bound=round(lower_bound, 6),
-            severity="critical" if deviation > sens * 1.5 else "warning",
-            reason=(f"[Z-score] {row['metric_name']} {current:.4f} — "
-                    f"{deviation:.1f}sigma {direction} {LOOKBACK_HOURS}h avg {avg:.4f}"),
+            severity=sev,
+            reason=(
+                f"[Z-score] {row['metric_name']} {current:.4f} — "
+                f"{deviation:.1f}sigma {direction} {LOOKBACK_HOURS}h avg {avg:.4f}"
+            ),
             data_points=len(values), algorithm="zscore",
         )
     return None
@@ -1062,6 +1631,16 @@ def detect(
     now_str       = datetime.now(timezone.utc).isoformat()
     sens          = METRIC_SENSITIVITY.get(metric_name, SENSITIVITY)
 
+    # Layer 0: CPU safety net (MISS-BUG-3) — fires for ANY cpu-like metric >= threshold
+    result = _detect_high_cpu_safety_net(row, history_rows, now_str)
+    if result is not None:
+        log.debug(
+            f"[CPU-SafetyNet] {row['resource_name']}/{metric_name}: "
+            f"{current_value:.2f}% >= {CPU_SAFETY_NET_THRESHOLD}%"
+        )
+        return result
+
+    # Layer 1: Hard limits
     if metric_name in HARD_LIMITS:
         lo, hi = HARD_LIMITS[metric_name]
         if lo is not None and current_value < lo:
@@ -1087,6 +1666,7 @@ def detect(
                 data_points=len(history_rows), algorithm="hard_limit",
             )
 
+    # Layer 2: Always-bad
     if metric_name in ALWAYS_BAD_METRICS and current_value > 0:
         return Anomaly(
             detected_at=now_str, cloud=row["cloud"], region=row["region"],
@@ -1099,28 +1679,32 @@ def detect(
             data_points=len(history_rows), algorithm="always_bad",
         )
 
+    # Layers 3-6 require warmup
     ok, skip_reason = _warmup_ok(history_rows)
     if not ok:
         log.debug(f"  WARMUP {row['resource_name']}/{metric_name}: {skip_reason}")
         return None
 
     span_hours = _span_hours(history_rows)
-    span_mins  = span_hours * 60
 
-    river_result = _detect_river(row, history_rows, sens, now_str, trainer)
-    if river_result is not None:
-        return river_result
+    # Layer 3: River
+    result = _detect_river(row, history_rows, sens, now_str, trainer)
+    if result is not None:
+        return result
 
+    # Layer 4: Prophet
     if PROPHET_AVAILABLE and span_hours >= 2:
         result = _detect_prophet(row, history_rows, training_rows, sens, now_str, trainer)
         if result is not None:
             return result
 
-    if span_mins >= ISOFOREST_MIN_MINS:
+    # Layer 5: IsolationForest
+    if span_hours * 60 >= ISOFOREST_MIN_MINS:
         result = _detect_isoforest(row, history_rows, sens, now_str, trainer)
         if result is not None:
             return result
 
+    # Layer 6: Z-score
     return _detect_zscore(row, history_rows, sens, now_str)
 
 
@@ -1158,58 +1742,112 @@ def _send_slack_blocking(anomaly: Anomaly) -> None:
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status != 200:
-                log.warning(f"Slack returned HTTP {resp.status}")
+                log.warning(f"Slack HTTP {resp.status}")
     except Exception as e:
         log.warning(f"Slack failed: {e}")
 
 
 def send_slack(anomaly: Anomaly) -> None:
-    if not SLACK_WEBHOOK:
-        return
-    threading.Thread(target=_send_slack_blocking, args=(anomaly,), daemon=True).start()
+    if SLACK_WEBHOOK:
+        threading.Thread(target=_send_slack_blocking, args=(anomaly,), daemon=True).start()
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Anomaly]:
-    all_metrics = reader.get_all_active_metrics()
-    if not all_metrics:
-        log.warning("No metrics found. Is main.py running?")
+    all_metrics_raw = reader.get_all_active_metrics()
+    if not all_metrics_raw:
+        log.warning("No active metrics found. Is the collector running?")
         return []
 
-    # ── Global IsoForest retrain check — ONE decision per cycle ──────────────
-    # Fetches all metrics in one DB query, decides once whether to replace
-    # isoforest.joblib. All per-metric detection then reuses the loaded model.
+    # MISS-BUG-1 fix: normalise every metric row before detection.
+    # Log a sample of raw → canonical mappings for operator visibility.
+    all_metrics = [_normalize_row(r) for r in all_metrics_raw]
+
+    # Diagnostic: log distinct raw→canonical name pairs so mismatches are obvious.
+    name_pairs = {
+        (r.get("_raw_metric_name", ""), r["metric_name"])
+        for r in all_metrics
+        if r.get("_raw_metric_name", "") != r["metric_name"]
+    }
+    if name_pairs:
+        sample = list(name_pairs)[:8]
+        log.info(
+            f"[Normalise] {len(name_pairs)} metric name(s) aliased. "
+            f"Sample: {sample}"
+        )
+
     all_training = reader.get_all_training_data(hours=ISOFOREST_WINDOW_HOURS)
     trainer.maybe_retrain_isoforest(all_training)
 
+    log.info("Fetching bulk history (2h + 168h windows)...")
+    history_2h   = reader.get_all_history_bulk(hours=LOOKBACK_HOURS)
+    history_168h = reader.get_all_history_bulk(hours=PROPHET_WINDOW_HOURS)
+
     log.info(f"Checking {len(all_metrics)} metric/resource combinations...")
-    found:     List[Anomaly]    = []
-    normal = warming            = 0
-    algo_counts: Dict[str, int] = {}
 
-    for row in all_metrics:
+    # MISS-BUG-4: log sample of active metric names to help diagnose name issues
+    distinct_canonical = sorted({r["metric_name"] for r in all_metrics})
+    log.info(f"[Metrics] Distinct canonical names ({len(distinct_canonical)}): "
+             f"{distinct_canonical[:20]}"
+             + ("…" if len(distinct_canonical) > 20 else ""))
+
+    found:        List[Anomaly]  = []
+    found_lock    = threading.Lock()
+    counters_lock = threading.Lock()
+    normal = warming             = 0
+    algo_counts: Dict[str, int]  = {}
+    _cycle_seen: Set[str]        = set()
+
+    def _check_one(row: dict) -> Tuple[dict, Optional[Anomaly]]:
         if row["metric_name"] in IGNORE_METRICS:
-            continue
-        history_rows  = reader.get_history(row["resource_id"], row["metric_name"])
-        training_rows = reader.get_history(
-            row["resource_id"], row["metric_name"], hours=PROPHET_WINDOW_HOURS
+            return row, None
+        # Key uses canonical metric name (already normalised in row)
+        key = f"{row['resource_id']}::{row['metric_name']}"
+        return row, detect(
+            row,
+            history_2h.get(key, []),
+            history_168h.get(key, []),
+            trainer,
         )
-        anomaly = detect(row, history_rows, training_rows, trainer)
 
-        if anomaly is None:
-            ok, _ = _warmup_ok(history_rows)
-            if not ok and row["metric_name"] not in ALWAYS_BAD_METRICS:
-                warming += 1
-            else:
-                normal += 1
-            continue
+    with ThreadPoolExecutor(max_workers=DETECTION_WORKERS) as executor:
+        futures = {executor.submit(_check_one, row): row for row in all_metrics}
+        for future in as_completed(futures):
+            try:
+                row, anomaly = future.result()
+            except Exception as exc:
+                log.error(f"Detection task failed: {exc}", exc_info=True)
+                continue
 
-        if reader.recent_anomaly_count(row["resource_id"], row["metric_name"], minutes=30) > 0:
-            log.debug(f"  Suppressed repeat: {row['resource_name']}/{row['metric_name']}")
-            continue
+            if anomaly is None:
+                key = f"{row['resource_id']}::{row['metric_name']}"
+                ok, _ = _warmup_ok(history_2h.get(key, []))
+                with counters_lock:
+                    if not ok and row["metric_name"] not in ALWAYS_BAD_METRICS:
+                        warming += 1
+                    else:
+                        normal += 1
+                continue
 
-        algo_counts[anomaly.algorithm] = algo_counts.get(anomaly.algorithm, 0) + 1
-        found.append(anomaly)
+            if anomaly.algorithm not in _NO_SUPPRESS_ALGOS:
+                if reader.recent_anomaly_count(
+                    row["resource_id"], row["metric_name"],
+                    minutes=DEDUP_WINDOW_MINUTES,
+                ) > 0:
+                    log.debug(
+                        f"  Suppressed repeat [{anomaly.algorithm}]: "
+                        f"{row['resource_name']}/{row['metric_name']}"
+                    )
+                    continue
+
+            dedup_key = f"{row['resource_id']}::{row['metric_name']}"
+            with found_lock:
+                if dedup_key in _cycle_seen:
+                    log.debug(f"  Cycle-dedup: {dedup_key}")
+                    continue
+                _cycle_seen.add(dedup_key)
+                algo_counts[anomaly.algorithm] = algo_counts.get(anomaly.algorithm, 0) + 1
+                found.append(anomaly)
 
     assign_correlation_ids(found)
 
@@ -1224,29 +1862,46 @@ def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Ano
         reader.save_anomaly(a)
         send_slack(a)
 
+    now_ts = datetime.now(timezone.utc).isoformat()
+    trainer.flush_river(data_size=len(all_metrics), last_ts=now_ts)
+
     algo_str = ", ".join(f"{k}:{v}" for k, v in algo_counts.items()) or "none"
-    log.info(f"Done. Found {len(found)} [{algo_str}]. Normal:{normal}. Warming:{warming}.")
+    log.info(f"Done. {len(found)} anomalies [{algo_str}]. Normal:{normal}. Warming:{warming}.")
     return found
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  AIOps Anomaly Detector — Single-file-per-algo Continuous Training")
-    log.info(f"  Config    : {CONFIG_PATH}")
-    log.info(f"  Model dir : {MODEL_DIR}/")
-    log.info(f"    isoforest.joblib  — global model, REPLACED on retrain")
-    log.info(f"    prophet.joblib    — series dict, REPLACED on any series retrain")
-    log.info(f"    river.joblib      — global model, REPLACED every cycle")
-    log.info(f"    models.meta.json  — training metadata")
-    log.info(f"  IsoForest : window={ISOFOREST_WINDOW_HOURS}h, "
-             f"retrain@{ISOFOREST_RETRAIN_THRESHOLD*100:.0f}%new or {ISOFOREST_MAX_AGE_HOURS}h")
-    log.info(f"  Prophet   : {'on' if PROPHET_AVAILABLE else 'NOT installed'}, "
-             f"window={PROPHET_WINDOW_HOURS}h, "
-             f"retrain@{PROPHET_RETRAIN_THRESHOLD*100:.0f}%new or {PROPHET_MAX_AGE_HOURS}h")
-    log.info(f"  River     : {'on' if RIVER_AVAILABLE else 'NOT installed (pip install river)'}, "
+    log.info("  AIOps Anomaly Detector — v9 (metric-name normalisation + CPU safety-net)")
+    log.info(f"  Config          : {CONFIG_PATH}")
+    log.info(f"  Model dir       : {MODEL_DIR}/")
+    log.info(f"  Interval        : {INTERVAL}s")
+    log.info(f"  Warmup          : {WARMUP_MINUTES}m / {MIN_DATAPOINTS} pts")
+    log.info(f"  Stale skip      : {STALE_THRESHOLD_MINUTES}m (was 5m in v8)")
+    log.info(f"  Dedup window    : {DEDUP_WINDOW_MINUTES}m (statistical algos only)")
+    log.info(f"  Workers         : {DETECTION_WORKERS}")
+    log.info(f"  CPU safety-net  : >= {CPU_SAFETY_NET_THRESHOLD}% → always CRITICAL")
+    log.info(f"  IsoForest       : min_pct={ISOFOREST_MIN_PCT_DEVIATION}%, "
+             f"min_abs={ISOFOREST_MIN_ABS_DEVIATION}, "
+             f"score<={ISOFOREST_MIN_SCORE_THRESHOLD}, "
+             f"window={ISOFOREST_WINDOW_HOURS}h")
+    log.info(f"  Prophet         : {'on' if PROPHET_AVAILABLE else 'NOT installed'}, "
+             f"window={PROPHET_WINDOW_HOURS}h, max_age={PROPHET_MAX_AGE_HOURS}h, "
+             f"evict>{PROPHET_IMPLAUSIBLE_FACTOR}× mean OR "
+             f">{PROPHET_IMPLAUSIBLE_ABS_FACTOR}× std")
+    log.info(f"  River           : {'on' if RIVER_AVAILABLE else 'NOT installed'}, "
              f"threshold={RIVER_SCORE_THRESHOLD}")
-    log.info(f"  Slack     : {'configured (async)' if SLACK_WEBHOOK else 'NOT SET'}")
+    log.info(f"  Slack           : {'configured' if SLACK_WEBHOOK else 'NOT SET'}")
+    log.info(f"  Hard limits     : {len(HARD_LIMITS)} metrics")
+    log.info(f"  Always-bad      : {len(ALWAYS_BAD_METRICS)} metrics")
+    log.info(f"  Non-negative    : {len(_NON_NEGATIVE_METRICS)} metrics (forecast clamped >= 0)")
+    log.info(f"  Aliases         : {len(_METRIC_NAME_ALIASES)} metric name aliases")
+    both    = sum(1 for p in _METRIC_POLICY.values() if p.alert_high and p.alert_low)
+    hi_only = sum(1 for p in _METRIC_POLICY.values() if p.alert_high and not p.alert_low)
+    lo_only = sum(1 for p in _METRIC_POLICY.values() if p.alert_low  and not p.alert_high)
+    log.info(f"  Metric policies : {len(_METRIC_POLICY)} "
+             f"({both} bidirectional, {hi_only} high-only, {lo_only} low-only)")
     log.info("=" * 70)
 
     _load_detection_config(CONFIG_PATH)
@@ -1274,7 +1929,7 @@ if __name__ == "__main__":
                     log.error(f"Cycle #{cycle} failed: {exc}", exc_info=True)
                 elapsed = time.time() - t0
                 sleep_s = max(0, INTERVAL - elapsed)
-                log.info(f"Cycle took {elapsed:.1f}s — next in {sleep_s:.0f}s")
+                log.info(f"Cycle {elapsed:.1f}s — next in {sleep_s:.0f}s")
                 time.sleep(sleep_s)
         except KeyboardInterrupt:
-            log.info("Stopped. Models saved to disk — training resumes on next start.")
+            log.info("Stopped.")

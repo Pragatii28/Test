@@ -6,10 +6,12 @@
 clouds:
   aws:
     enabled: true
-    access_key_id: ""
-    secret_access_key: ""
+    access_key_id: "AKIAURVYBUXHEAVGHA5V"
+    secret_access_key: "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"
     regions:
       - us-east-1
+      - eu-north-1
+      - ap-south-1
       # - us-west-2
       # - eu-west-1
     resources:

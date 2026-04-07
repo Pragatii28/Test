@@ -209,7 +209,7 @@ def sync_anomalies(conn, user_id: str) -> int:
             "severity":          severity if severity in ["critical","warning","info"] else "warning",
             "status":            status,
             "cloud":             row_dict.get("cloud", "aws"),
-            "region":            row_dict.get("region", "us-east-1"),
+            "region":            row_dict.get("region", ""),
             "resourceType":      row_dict.get("resource_type", ""),
             "resourceId":        row_dict.get("resource_id", ""),
             "resourceName":      row_dict.get("resource_name", ""),
