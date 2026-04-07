@@ -65,7 +65,8 @@ CHANGELOG:
                 immediately visible in the log.
 """
 from __future__ import annotations
-
+from rca.engine import RCAEngine
+from rca.pdf_report import generate_pdf
 import copy
 import json
 import logging
@@ -1860,6 +1861,16 @@ def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Ano
             + (f" [corr:{a.correlation_id}]" if a.correlation_id else "")
         )
         reader.save_anomaly(a)
+        # In your anomaly_detection.py — after save_anomaly(a):
+
+        engine = RCAEngine("observability_data/metrics.db")
+        report = engine.run_rca(
+            trigger_resource_id=a.resource_id,
+            trigger_metric=a.metric_name,
+            trigger_time=a.detected_at,
+            window_minutes=30,
+        )
+        pdf_path = generate_pdf(report, output_dir="rca_reports/")
         send_slack(a)
 
     now_ts = datetime.now(timezone.utc).isoformat()
