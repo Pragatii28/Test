@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "infra-healer": {
+      "command": "C:\\Users\\Pragati.Sagar\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+      "args": [
+        "C:\\Users\\Pragati.Sagar\\Downloads\\multi_cloud_collector\\mcp_server.py"
+      ],
+      "env": {
+        "DB_PATH": "C:\\Users\\Pragati.Sagar\\Downloads\\multi_cloud_collector\\observability_data\\metrics.db"
+      }
+    }
+  }
+}
