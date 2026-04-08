@@ -1,31 +1,29 @@
-"""
-rca/engine.py — Root Cause Analysis Engine
-Reads from your existing SQLite DB (metrics + anomalies tables)
-and produces a structured RCA report dict ready for PDF generation.
-
-How it works:
-1. When an anomaly is detected, fetch a lookback window of metrics
-2. Find all other resources/metrics that spiked around the same time
-3. Rank candidates by temporal proximity + severity
-4. Check error logs in the same window
-5. Build a causal chain: root cause → cascading effects
-"""
-
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import statistics
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger("rca.engine")
 
 
-# ── Data structures ────────────────────────────────────────────────────────────
+# ── Optional MCP client import ───────────────────────────────────────────────
+# This file ONLY calls MCP if the client/tool is available.
+# It does not implement MCP server logic here.
+try:
+    from mcp_client import MCPClient  # expected external wrapper/client
+    MCP_CLIENT_AVAILABLE = True
+except Exception:
+    MCPClient = None
+    MCP_CLIENT_AVAILABLE = False
+
+
+# ── Data structures ───────────────────────────────────────────────────────────
 
 @dataclass
 class CausalCandidate:
@@ -38,9 +36,9 @@ class CausalCandidate:
     metric_value: float
     baseline_avg: float
     deviation_pct: float
-    first_seen_at: str          # earliest anomalous timestamp in window
-    time_offset_seconds: float  # seconds BEFORE the trigger anomaly (negative = after)
-    correlation_score: float    # 0.0 – 1.0
+    first_seen_at: str
+    time_offset_seconds: float
+    correlation_score: float
     is_root_cause: bool = False
 
 
@@ -55,7 +53,6 @@ class ErrorLogEntry:
 
 @dataclass
 class RCAReport:
-    # Identity
     report_id: str
     generated_at: str
     trigger_anomaly_time: str
@@ -67,36 +64,50 @@ class RCAReport:
     trigger_cloud: str
     trigger_region: str
 
-    # Analysis
     root_cause: Optional[CausalCandidate]
     cascading_effects: List[CausalCandidate]
     related_errors: List[ErrorLogEntry]
-    timeline: List[Dict[str, Any]]           # chronological events
-    summary: str                              # human-readable paragraph
+    timeline: List[Dict[str, Any]]
+    summary: str
     recommended_actions: List[str]
-    confidence: float                         # 0.0 – 1.0
+    confidence: float
 
-    # Raw data for charting
-    metric_history: Dict[str, List[Tuple[str, float]]]  # key = "resource::metric"
+    metric_history: Dict[str, List[Tuple[str, float]]]
+
+    # NEW: MCP enrichment result
+    mcp_analysis: Optional[Dict[str, Any]] = None
 
 
 # ── RCA Engine ────────────────────────────────────────────────────────────────
 
 class RCAEngine:
     """
-    Plugs into your existing SQLite DB.
-    Call run_rca() right after an Anomaly is saved to the anomalies table.
+    Reads from your existing SQLite DB and produces a structured RCA report.
+    Optional MCP enrichment can be applied on top of heuristic RCA.
     """
 
-    LOOKBACK_MINUTES = 30       # how far back before the trigger to scan
-    LOOKAHEAD_MINUTES = 10      # how far ahead of trigger to capture cascade
-    DEVIATION_THRESHOLD = 30.0  # % deviation from baseline to count as anomalous
-    CORRELATION_DECAY = 0.05    # score decays per minute of temporal distance
+    LOOKBACK_MINUTES = 30
+    LOOKAHEAD_MINUTES = 10
+    DEVIATION_THRESHOLD = 30.0
+    CORRELATION_DECAY = 0.05
 
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+
+        self.enable_mcp = os.getenv("RCA_USE_MCP", "true").lower() == "true"
+        self.mcp_timeout_seconds = int(os.getenv("RCA_MCP_TIMEOUT_SECONDS", "30"))
+        self.mcp_tool_name = os.getenv("RCA_MCP_TOOL_NAME", "analyze_rca")
+
+        self._mcp_client = None
+        if self.enable_mcp and MCP_CLIENT_AVAILABLE:
+            try:
+                self._mcp_client = MCPClient(timeout=self.mcp_timeout_seconds)
+                log.info("MCP client initialized for RCA enrichment")
+            except Exception as e:
+                log.warning(f"Failed to initialize MCP client: {e}")
+                self._mcp_client = None
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -107,58 +118,82 @@ class RCAEngine:
         trigger_time: Optional[str] = None,
         window_minutes: int = LOOKBACK_MINUTES,
     ) -> RCAReport:
-        """
-        Main entry point. Run after an anomaly is detected.
-        Returns a fully populated RCAReport.
-        """
         if trigger_time is None:
             trigger_time = datetime.now(timezone.utc).isoformat()
 
         trigger_dt = _parse_ts(trigger_time)
         window_start = (trigger_dt - timedelta(minutes=window_minutes)).isoformat()
-        window_end   = (trigger_dt + timedelta(minutes=self.LOOKAHEAD_MINUTES)).isoformat()
+        window_end = (trigger_dt + timedelta(minutes=self.LOOKAHEAD_MINUTES)).isoformat()
 
-        # --- 1. Get trigger anomaly details ---
         trigger_row = self._get_latest_anomaly(trigger_resource_id, trigger_metric)
-
-        # --- 2. Get all metrics in the window (cross-resource) ---
         all_metrics = self._get_all_metrics_in_window(window_start, window_end)
 
-        # --- 3. Compute baseline (the hour before the window) ---
         baseline_start = (trigger_dt - timedelta(hours=1, minutes=window_minutes)).isoformat()
-        baseline_end   = window_start
+        baseline_end = window_start
         baselines = self._compute_baselines(baseline_start, baseline_end)
 
-        # --- 4. Find candidates (anomalous metrics in window) ---
         candidates = self._find_candidates(
-            all_metrics, baselines, trigger_dt,
-            trigger_resource_id, trigger_metric
+            all_metrics,
+            baselines,
+            trigger_dt,
+            trigger_resource_id,
+            trigger_metric,
         )
 
-        # --- 5. Rank and identify root cause ---
         root_cause, cascading = self._rank_candidates(candidates, trigger_dt)
 
-        # --- 6. Pull error logs ---
         error_logs = self._get_error_logs(window_start, window_end)
 
-        # --- 7. Build timeline ---
         timeline = self._build_timeline(
-            root_cause, cascading, error_logs, trigger_row, trigger_time
+            root_cause,
+            cascading,
+            error_logs,
+            trigger_row,
+            trigger_time,
         )
 
-        # --- 8. Build metric history for charts ---
         metric_history = self._build_metric_history(
-            root_cause, cascading, window_start, window_end
+            root_cause,
+            cascading,
+            window_start,
+            window_end,
         )
 
-        # --- 9. Generate summary + actions ---
         summary, actions = self._generate_summary(
-            trigger_row, root_cause, cascading, error_logs
+            trigger_row,
+            root_cause,
+            cascading,
+            error_logs,
         )
 
         confidence = self._compute_confidence(root_cause, candidates, error_logs)
 
         report_id = f"RCA-{trigger_dt.strftime('%Y%m%d-%H%M%S')}-{trigger_resource_id[:8]}"
+
+        mcp_analysis = self._run_mcp_analysis(
+            trigger_row=trigger_row,
+            trigger_resource_id=trigger_resource_id,
+            trigger_metric=trigger_metric,
+            trigger_time=trigger_time,
+            root_cause=root_cause,
+            cascading=cascading,
+            error_logs=error_logs,
+            timeline=timeline,
+            metric_history=metric_history,
+            heuristic_summary=summary,
+            heuristic_actions=actions,
+            heuristic_confidence=confidence,
+            candidates=candidates,
+        )
+
+        # Optional merge: use MCP output only as enrichment, not hard override
+        if mcp_analysis:
+            summary, actions, confidence = self._merge_mcp_into_report(
+                summary,
+                actions,
+                confidence,
+                mcp_analysis,
+            )
 
         return RCAReport(
             report_id=report_id,
@@ -179,38 +214,156 @@ class RCAEngine:
             recommended_actions=actions,
             confidence=confidence,
             metric_history=metric_history,
+            mcp_analysis=mcp_analysis,
         )
+
+    # ── MCP integration ────────────────────────────────────────────────────────
+
+    def _run_mcp_analysis(
+        self,
+        trigger_row: Optional[sqlite3.Row],
+        trigger_resource_id: str,
+        trigger_metric: str,
+        trigger_time: str,
+        root_cause: Optional[CausalCandidate],
+        cascading: List[CausalCandidate],
+        error_logs: List[ErrorLogEntry],
+        timeline: List[Dict[str, Any]],
+        metric_history: Dict[str, List[Tuple[str, float]]],
+        heuristic_summary: str,
+        heuristic_actions: List[str],
+        heuristic_confidence: float,
+        candidates: List[CausalCandidate],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Only CALLS an external MCP tool/client.
+        No MCP server logic is implemented here.
+        """
+        if not self.enable_mcp:
+            log.info("MCP enrichment disabled by RCA_USE_MCP=false")
+            return None
+
+        if self._mcp_client is None:
+            log.info("MCP client not available, skipping MCP enrichment")
+            return None
+
+        payload = {
+            "incident": {
+                "trigger_time": trigger_time,
+                "trigger_resource_id": trigger_resource_id,
+                "trigger_metric": trigger_metric,
+                "trigger_resource_name": trigger_row["resource_name"] if trigger_row else trigger_resource_id,
+                "trigger_resource_type": trigger_row["resource_type"] if trigger_row else "unknown",
+                "trigger_cloud": trigger_row["cloud"] if trigger_row else "unknown",
+                "trigger_region": trigger_row["region"] if trigger_row else "unknown",
+                "trigger_value": float(trigger_row["current_value"]) if trigger_row else 0.0,
+                "trigger_severity": trigger_row["severity"] if trigger_row else "warning",
+            },
+            "heuristic_rca": {
+                "root_cause": asdict(root_cause) if root_cause else None,
+                "cascading_effects": [asdict(c) for c in cascading],
+                "summary": heuristic_summary,
+                "recommended_actions": heuristic_actions,
+                "confidence": heuristic_confidence,
+                "candidates": [asdict(c) for c in candidates[:15]],
+            },
+            "error_logs": [asdict(e) for e in error_logs[:20]],
+            "timeline": timeline[:30],
+            "metric_history": metric_history,
+        }
+
+        try:
+            result = self._mcp_client.call_tool(
+                self.mcp_tool_name,
+                payload,
+            )
+
+            if not result:
+                log.info("MCP returned empty result")
+                return None
+
+            if isinstance(result, str):
+                try:
+                    result = json.loads(result)
+                except Exception:
+                    result = {"raw_result": result}
+
+            if not isinstance(result, dict):
+                result = {"raw_result": result}
+
+            log.info("MCP RCA enrichment completed successfully")
+            return result
+
+        except Exception as e:
+            log.warning(f"MCP RCA enrichment failed: {e}")
+            return None
+
+    def _merge_mcp_into_report(
+        self,
+        summary: str,
+        actions: List[str],
+        confidence: float,
+        mcp_analysis: Dict[str, Any],
+    ) -> Tuple[str, List[str], float]:
+        """
+        Merge MCP output conservatively.
+        Keeps heuristic RCA as base and appends MCP insights.
+        """
+        merged_summary = summary
+        merged_actions = list(actions)
+        merged_confidence = confidence
+
+        mcp_summary = mcp_analysis.get("summary") or mcp_analysis.get("explanation")
+        if mcp_summary:
+            merged_summary = f"{summary}\n\nMCP Analysis: {mcp_summary}"
+
+        mcp_actions = mcp_analysis.get("recommended_actions") or mcp_analysis.get("actions")
+        if isinstance(mcp_actions, list):
+            for action in mcp_actions:
+                if action and action not in merged_actions:
+                    merged_actions.append(str(action))
+
+        mcp_conf = mcp_analysis.get("confidence")
+        if isinstance(mcp_conf, (int, float)):
+            merged_confidence = round((confidence * 0.7) + (float(mcp_conf) * 0.3), 2)
+
+        return merged_summary, merged_actions, merged_confidence
 
     # ── DB Queries ─────────────────────────────────────────────────────────────
 
     def _get_latest_anomaly(self, resource_id: str, metric_name: str) -> Optional[sqlite3.Row]:
         return self._conn.execute(
-            """SELECT * FROM anomalies
-               WHERE resource_id=? AND metric_name=?
-               ORDER BY detected_at DESC LIMIT 1""",
+            """
+            SELECT * FROM anomalies
+            WHERE resource_id=? AND metric_name=?
+            ORDER BY detected_at DESC LIMIT 1
+            """,
             (resource_id, metric_name),
         ).fetchone()
 
-    def _get_all_metrics_in_window(
-        self, start: str, end: str
-    ) -> List[sqlite3.Row]:
+    def _get_all_metrics_in_window(self, start: str, end: str) -> List[sqlite3.Row]:
         return self._conn.execute(
-            """SELECT cloud, region, resource_type, resource_id, resource_name,
-                      metric_name, metric_value, metric_unit, collected_at
-               FROM metrics
-               WHERE collected_at BETWEEN ? AND ?
-               ORDER BY collected_at ASC""",
+            """
+            SELECT cloud, region, resource_type, resource_id, resource_name,
+                   metric_name, metric_value, metric_unit, collected_at
+            FROM metrics
+            WHERE collected_at BETWEEN ? AND ?
+            ORDER BY collected_at ASC
+            """,
             (start, end),
         ).fetchall()
 
     def _compute_baselines(
-        self, baseline_start: str, baseline_end: str
+        self,
+        baseline_start: str,
+        baseline_end: str,
     ) -> Dict[str, Dict[str, float]]:
-        """Returns {resource_id::metric_name: {mean, std}}"""
         rows = self._conn.execute(
-            """SELECT resource_id, metric_name, metric_value
-               FROM metrics
-               WHERE collected_at BETWEEN ? AND ?""",
+            """
+            SELECT resource_id, metric_name, metric_value
+            FROM metrics
+            WHERE collected_at BETWEEN ? AND ?
+            """,
             (baseline_start, baseline_end),
         ).fetchall()
 
@@ -224,20 +377,23 @@ class RCAEngine:
             if vals:
                 result[key] = {
                     "mean": statistics.mean(vals),
-                    "std":  statistics.stdev(vals) if len(vals) > 1 else 0.0,
+                    "std": statistics.stdev(vals) if len(vals) > 1 else 0.0,
                 }
         return result
 
     def _get_error_logs(self, start: str, end: str) -> List[ErrorLogEntry]:
         try:
             rows = self._conn.execute(
-                """SELECT cloud, resource_name, log_level, message, collected_at
-                   FROM logs
-                   WHERE collected_at BETWEEN ? AND ?
-                     AND log_level IN ('ERROR','CRITICAL','FATAL')
-                   ORDER BY collected_at ASC""",
+                """
+                SELECT cloud, resource_name, log_level, message, collected_at
+                FROM logs
+                WHERE collected_at BETWEEN ? AND ?
+                  AND log_level IN ('ERROR','CRITICAL','FATAL')
+                ORDER BY collected_at ASC
+                """,
                 (start, end),
             ).fetchall()
+
             return [
                 ErrorLogEntry(
                     cloud=r["cloud"],
@@ -249,7 +405,7 @@ class RCAEngine:
                 for r in rows
             ]
         except Exception:
-            return []   # logs table may not exist in all setups
+            return []
 
     # ── Analysis ───────────────────────────────────────────────────────────────
 
@@ -261,13 +417,13 @@ class RCAEngine:
         trigger_resource_id: str,
         trigger_metric: str,
     ) -> List[CausalCandidate]:
-        # Group by resource::metric, find first anomalous point
         series: Dict[str, List[sqlite3.Row]] = {}
         for r in all_metrics:
             key = f"{r['resource_id']}::{r['metric_name']}"
             series.setdefault(key, []).append(r)
 
         candidates: List[CausalCandidate] = []
+
         for key, rows in series.items():
             resource_id, metric_name = key.split("::", 1)
             baseline = baselines.get(key, {})
@@ -275,11 +431,10 @@ class RCAEngine:
                 continue
 
             mean = baseline["mean"]
-            std  = baseline["std"]
+            std = baseline["std"]
             if mean == 0 and std == 0:
                 continue
 
-            # Find first point that deviates significantly
             for row in rows:
                 val = float(row["metric_value"])
                 if mean != 0:
@@ -292,43 +447,35 @@ class RCAEngine:
 
                 first_seen_dt = _parse_ts(row["collected_at"])
                 offset_sec = (trigger_dt - first_seen_dt).total_seconds()
-                # Positive offset = happened BEFORE trigger (potential cause)
-                # Negative offset = happened AFTER trigger (potential effect)
-
                 corr = self._correlation_score(offset_sec, dev_pct)
 
-                candidates.append(CausalCandidate(
-                    resource_id=resource_id,
-                    resource_name=row["resource_name"],
-                    resource_type=row["resource_type"],
-                    cloud=row["cloud"],
-                    region=row["region"],
-                    metric_name=metric_name,
-                    metric_value=val,
-                    baseline_avg=round(mean, 4),
-                    deviation_pct=round(dev_pct, 1),
-                    first_seen_at=row["collected_at"],
-                    time_offset_seconds=offset_sec,
-                    correlation_score=corr,
-                ))
-                break  # only first anomalous point per series
+                candidates.append(
+                    CausalCandidate(
+                        resource_id=resource_id,
+                        resource_name=row["resource_name"],
+                        resource_type=row["resource_type"],
+                        cloud=row["cloud"],
+                        region=row["region"],
+                        metric_name=metric_name,
+                        metric_value=val,
+                        baseline_avg=round(mean, 4),
+                        deviation_pct=round(dev_pct, 1),
+                        first_seen_at=row["collected_at"],
+                        time_offset_seconds=offset_sec,
+                        correlation_score=corr,
+                    )
+                )
+                break
 
         return candidates
 
     def _correlation_score(self, offset_sec: float, dev_pct: float) -> float:
-        """
-        Score 0-1. Higher = more likely to be root cause.
-        Peaks at offset ~60-300s before trigger (happened shortly before).
-        Decays for things that happened much earlier or after.
-        """
         severity_factor = min(dev_pct / 100, 1.0)
         minutes = offset_sec / 60.0
 
         if minutes < 0:
-            # Happened AFTER trigger → cascade effect, lower score
             time_factor = max(0, 1 - abs(minutes) * 0.15)
         elif 0 <= minutes <= 5:
-            # Happened 0-5min before → very likely root cause
             time_factor = 0.95
         elif 5 < minutes <= 15:
             time_factor = 0.80
@@ -347,12 +494,11 @@ class RCAEngine:
         if not candidates:
             return None, []
 
-        # Sort by correlation score descending
         sorted_c = sorted(candidates, key=lambda c: c.correlation_score, reverse=True)
 
-        # Root cause = highest score that happened BEFORE the trigger
         root_cause = None
-        effects = []
+        effects: List[CausalCandidate] = []
+
         for c in sorted_c:
             if c.time_offset_seconds > 0 and root_cause is None:
                 root_cause = c
@@ -365,7 +511,7 @@ class RCAEngine:
             root_cause.is_root_cause = True
             effects = sorted_c[1:]
 
-        return root_cause, effects[:8]   # cap at 8 cascading effects
+        return root_cause, effects[:8]
 
     def _build_timeline(
         self,
@@ -378,45 +524,53 @@ class RCAEngine:
         events: List[Dict[str, Any]] = []
 
         if root_cause:
-            events.append({
-                "time": root_cause.first_seen_at,
-                "type": "root_cause",
-                "resource": root_cause.resource_name,
-                "metric": root_cause.metric_name,
-                "value": root_cause.metric_value,
-                "label": f"ROOT CAUSE: {root_cause.metric_name} deviated {root_cause.deviation_pct:.0f}% on {root_cause.resource_name}",
-            })
+            events.append(
+                {
+                    "time": root_cause.first_seen_at,
+                    "type": "root_cause",
+                    "resource": root_cause.resource_name,
+                    "metric": root_cause.metric_name,
+                    "value": root_cause.metric_value,
+                    "label": f"ROOT CAUSE: {root_cause.metric_name} deviated {root_cause.deviation_pct:.0f}% on {root_cause.resource_name}",
+                }
+            )
 
         for e in errors:
-            events.append({
-                "time": e.collected_at,
-                "type": "error_log",
-                "resource": e.resource_name,
-                "metric": "log",
-                "value": None,
-                "label": f"[{e.log_level}] {e.resource_name}: {e.message[:80]}",
-            })
+            events.append(
+                {
+                    "time": e.collected_at,
+                    "type": "error_log",
+                    "resource": e.resource_name,
+                    "metric": "log",
+                    "value": None,
+                    "label": f"[{e.log_level}] {e.resource_name}: {e.message[:80]}",
+                }
+            )
 
         if trigger_row:
-            events.append({
-                "time": trigger_time,
-                "type": "trigger",
-                "resource": trigger_row["resource_name"],
-                "metric": trigger_row["metric_name"],
-                "value": float(trigger_row["current_value"]),
-                "label": f"ANOMALY DETECTED: {trigger_row['metric_name']} on {trigger_row['resource_name']}",
-            })
+            events.append(
+                {
+                    "time": trigger_time,
+                    "type": "trigger",
+                    "resource": trigger_row["resource_name"],
+                    "metric": trigger_row["metric_name"],
+                    "value": float(trigger_row["current_value"]),
+                    "label": f"ANOMALY DETECTED: {trigger_row['metric_name']} on {trigger_row['resource_name']}",
+                }
+            )
 
         for c in cascading[:5]:
-            if c.time_offset_seconds < 0:  # happened after trigger
-                events.append({
-                    "time": c.first_seen_at,
-                    "type": "cascade",
-                    "resource": c.resource_name,
-                    "metric": c.metric_name,
-                    "value": c.metric_value,
-                    "label": f"CASCADE: {c.metric_name} affected on {c.resource_name} ({c.deviation_pct:.0f}% deviation)",
-                })
+            if c.time_offset_seconds < 0:
+                events.append(
+                    {
+                        "time": c.first_seen_at,
+                        "type": "cascade",
+                        "resource": c.resource_name,
+                        "metric": c.metric_name,
+                        "value": c.metric_value,
+                        "label": f"CASCADE: {c.metric_name} affected on {c.resource_name} ({c.deviation_pct:.0f}% deviation)",
+                    }
+                )
 
         events.sort(key=lambda e: e["time"])
         return events
@@ -430,7 +584,7 @@ class RCAEngine:
     ) -> Dict[str, List[Tuple[str, float]]]:
         result: Dict[str, List[Tuple[str, float]]] = {}
 
-        targets = []
+        targets: List[Tuple[str, str]] = []
         if root_cause:
             targets.append((root_cause.resource_id, root_cause.metric_name))
         for c in cascading[:3]:
@@ -438,14 +592,20 @@ class RCAEngine:
 
         for resource_id, metric_name in targets:
             rows = self._conn.execute(
-                """SELECT collected_at, metric_value FROM metrics
-                   WHERE resource_id=? AND metric_name=?
-                     AND collected_at BETWEEN ? AND ?
-                   ORDER BY collected_at ASC""",
+                """
+                SELECT collected_at, metric_value FROM metrics
+                WHERE resource_id=? AND metric_name=?
+                  AND collected_at BETWEEN ? AND ?
+                ORDER BY collected_at ASC
+                """,
                 (resource_id, metric_name, window_start, window_end),
             ).fetchall()
+
             key = f"{resource_id[:12]}::{metric_name}"
-            result[key] = [(r["collected_at"], float(r["metric_value"])) for r in rows]
+            result[key] = [
+                (r["collected_at"], float(r["metric_value"]))
+                for r in rows
+            ]
 
         return result
 
@@ -458,15 +618,15 @@ class RCAEngine:
         cascading: List[CausalCandidate],
         errors: List[ErrorLogEntry],
     ) -> Tuple[str, List[str]]:
-        trigger_name   = trigger_row["resource_name"] if trigger_row else "unknown resource"
-        trigger_metric = trigger_row["metric_name"]   if trigger_row else "unknown metric"
+        trigger_name = trigger_row["resource_name"] if trigger_row else "unknown resource"
+        trigger_metric = trigger_row["metric_name"] if trigger_row else "unknown metric"
 
         if root_cause:
             rc_desc = (
                 f"The analysis identified {root_cause.resource_name} ({root_cause.resource_type}) "
                 f"as the most likely root cause. Its {root_cause.metric_name} deviated "
                 f"{root_cause.deviation_pct:.0f}% from baseline approximately "
-                f"{abs(root_cause.time_offset_seconds/60):.1f} minutes before the primary anomaly "
+                f"{abs(root_cause.time_offset_seconds / 60):.1f} minutes before the primary anomaly "
                 f"was triggered on {trigger_name}/{trigger_metric}."
             )
         else:
@@ -478,9 +638,7 @@ class RCAEngine:
 
         cascade_desc = ""
         if cascading:
-            affected = ", ".join(
-                f"{c.resource_name}/{c.metric_name}" for c in cascading[:3]
-            )
+            affected = ", ".join(f"{c.resource_name}/{c.metric_name}" for c in cascading[:3])
             cascade_desc = f" Cascading effects were observed on: {affected}."
 
         error_desc = ""
@@ -492,7 +650,6 @@ class RCAEngine:
 
         summary = rc_desc + cascade_desc + error_desc
 
-        # Recommended actions based on what was found
         actions: List[str] = []
 
         if root_cause:
@@ -526,9 +683,7 @@ class RCAEngine:
         if errors:
             actions.append("Review error logs in the incident window (included in this report)")
         if cascading:
-            actions.append(
-                "Validate that cascading resources have returned to normal baseline values"
-            )
+            actions.append("Validate that cascading resources have returned to normal baseline values")
         actions.append("Acknowledge this anomaly in the dashboard once remediation is confirmed")
 
         return summary, actions
@@ -544,10 +699,9 @@ class RCAEngine:
 
         score = root_cause.correlation_score
         if errors:
-            # Error logs in the window boost confidence
             score = min(score + 0.10, 1.0)
+
         if len(all_candidates) > 1:
-            # If there's a clear leader vs second place, more confident
             sorted_c = sorted(all_candidates, key=lambda c: c.correlation_score, reverse=True)
             if len(sorted_c) > 1:
                 gap = sorted_c[0].correlation_score - sorted_c[1].correlation_score
@@ -556,7 +710,7 @@ class RCAEngine:
         return round(score, 2)
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _parse_ts(ts: str) -> datetime:
     ts = ts.replace("Z", "+00:00")

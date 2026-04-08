@@ -1,7 +1,7 @@
 """
 mcp_server.py
 ─────────────
-MCP Server for your Infra Healing Tool.
+MCP Server for Infra Healing Tool.
 
 Run it: python mcp_server.py
 """

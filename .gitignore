@@ -4,3 +4,4 @@ logs/
 *.log
 observability_data/
 models/*.joblib
+rca_reports/

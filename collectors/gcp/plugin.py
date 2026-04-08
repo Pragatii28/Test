@@ -1,7 +1,7 @@
 """
 collectors/gcp/plugin.py
 ────────────────────────
-GCP cloud collector: GCE, Cloud Functions, Cloud Run, GKE.
+GCP cloud collector
 """
 from __future__ import annotations
 
