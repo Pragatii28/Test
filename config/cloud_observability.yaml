@@ -6,8 +6,8 @@
 clouds:
   aws:
     enabled: true
-    access_key_id: "AKIAURVYBUXHEAVGHA5V"
-    secret_access_key: "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"
+    access_key_id: ""
+    secret_access_key: ""
     regions:
       - us-east-1
       - eu-north-1
@@ -67,6 +67,7 @@ storage:
   # ── SQLite (default, zero dependencies) ───────────────────────────────────
   sqlite:
     path: observability_data/metrics.db
+    #path: observability_data/dummy_7day.db
 
   # ── PostgreSQL ─────────────────────────────────────────────────────────────
   # Uncomment to use PostgreSQL (pip install psycopg2-binary)
@@ -103,3 +104,27 @@ storage:
 collection:
   parallel_clouds: true
   max_workers: 8
+
+anomaly_detection:
+  # RCA Configuration (Patch #1)
+  rca_enabled: true
+  rca_report_dir: "rca_reports/"
+  rca_timeout_seconds: 30
+  rca_max_anomalies_per_cycle: 5
+  
+  # Metric-specific minimums (Patch #6)
+  # These override MIN_DATAPOINTS for specific metrics
+  network_packets_in: 2
+  network_packets_out: 2
+  status_check_failed: 1
+  
+  # Dedup windows (Patch #7)
+  dedup_windows:
+    always_bad: 30          # minutes
+    hard_limit: 30
+    cpu_safety_net: 5
+    prophet: 5
+    isolation_forest: 5
+    river: 5
+    zscore: 5
+  

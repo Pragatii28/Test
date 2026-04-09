@@ -2,6 +2,18 @@
 collectors/aws/plugin.py
 ────────────────────────
 AWS cloud collector: EC2, RDS, Lambda, ELB (ALB), DynamoDB.
+UPDATED: All patches applied (v2)
+
+Fixes applied:
+  1. Correct metric aggregation — Sum/Average/Maximum across ALL data points
+  2. RDS/DynamoDB default period is 300s; EC2/Lambda/ELB default is 60s
+  3. effective_start derived from maximum period for >= 2 datapoints
+  4. Lambda resource id uses FunctionName; ARN in labels
+  5. ELB dimension extraction uses robust index-based strip
+  6. GetMetricData pagination lambda captures batch_q via default arg
+  7. describe_log_groups pagination respects max_log_groups at API level
+  
+  PATCH #4: AWS timestamp handling — ensures ISO 8601 format always
 """
 from __future__ import annotations
 
@@ -33,7 +45,6 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
         aws = config.get("aws", {})
         session_kwargs: Dict[str, Any] = {}
 
-        # Config file takes priority; fall back to environment variables
         access_key    = aws.get("access_key_id")     or os.getenv("AWS_ACCESS_KEY_ID", "")
         secret_key    = aws.get("secret_access_key") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
         session_token = aws.get("session_token")     or os.getenv("AWS_SESSION_TOKEN", "")
@@ -47,7 +58,10 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
         if aws.get("profile"):
             session_kwargs["profile_name"] = aws["profile"]
 
-        logger.info(f"[AWS] Credential source: {'config file' if aws.get('access_key_id') else 'environment / IAM role'}")
+        logger.info(
+            f"[AWS] Credential source: "
+            f"{'config file' if aws.get('access_key_id') else 'environment / IAM role'}"
+        )
 
         import boto3
         self._session          = boto3.Session(**session_kwargs)
@@ -70,102 +84,87 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
                 "namespace": "AWS/EC2",
                 "dimension_key": "InstanceId",
                 "definitions": [
-                    {"name": "cpu_utilization_percent",          "cw_name": "CPUUtilization",              "stat": "Average", "unit": "percent"},
-                    {"name": "network_in_bytes",                 "cw_name": "NetworkIn",                   "stat": "Sum",     "unit": "bytes"},
-                    {"name": "network_out_bytes",                "cw_name": "NetworkOut",                  "stat": "Sum",     "unit": "bytes"},
-                    {"name": "disk_read_bytes",                  "cw_name": "DiskReadBytes",               "stat": "Sum",     "unit": "bytes"},
-                    {"name": "disk_write_bytes",                 "cw_name": "DiskWriteBytes",              "stat": "Sum",     "unit": "bytes"},
-                    {"name": "disk_read_ops",                    "cw_name": "DiskReadOps",                 "stat": "Sum",     "unit": "count"},
-                    {"name": "disk_write_ops",                   "cw_name": "DiskWriteOps",                "stat": "Sum",     "unit": "count"},
-                    {"name": "network_packets_in",               "cw_name": "NetworkPacketsIn",            "stat": "Sum",     "unit": "count"},
-                    {"name": "network_packets_out",              "cw_name": "NetworkPacketsOut",           "stat": "Sum",     "unit": "count"},
-                    {"name": "status_check_failed",              "cw_name": "StatusCheckFailed",           "stat": "Sum",     "unit": "count"},
-                    {"name": "memory_used_percent",              "cw_name": "MemoryUtilization",           "stat": "Average", "unit": "percent"},
-                    {"name": "disk_used_percent",                "cw_name": "DiskUtilization",             "stat": "Average", "unit": "percent"},
-                    {"name": "status_check_failed_instance",     "cw_name": "StatusCheckFailed_Instance",  "stat": "Sum",     "unit": "count"},
-                    {"name": "status_check_failed_system",       "cw_name": "StatusCheckFailed_System",    "stat": "Sum",     "unit": "count"},
+                    {"name": "cpu_utilization_percent",          "cw_name": "CPUUtilization",               "stat": "Average", "unit": "percent"},
+                    {"name": "network_in_bytes",                 "cw_name": "NetworkIn",                    "stat": "Sum",     "unit": "bytes"},
+                    {"name": "network_out_bytes",                "cw_name": "NetworkOut",                   "stat": "Sum",     "unit": "bytes"},
+                    {"name": "disk_read_bytes",                  "cw_name": "DiskReadBytes",                "stat": "Sum",     "unit": "bytes"},
+                    {"name": "disk_write_bytes",                 "cw_name": "DiskWriteBytes",               "stat": "Sum",     "unit": "bytes"},
+                    {"name": "disk_read_ops",                    "cw_name": "DiskReadOps",                  "stat": "Sum",     "unit": "count"},
+                    {"name": "disk_write_ops",                   "cw_name": "DiskWriteOps",                 "stat": "Sum",     "unit": "count"},
+                    {"name": "network_packets_in",               "cw_name": "NetworkPacketsIn",             "stat": "Sum",     "unit": "count"},
+                    {"name": "network_packets_out",              "cw_name": "NetworkPacketsOut",            "stat": "Sum",     "unit": "count"},
+                    {"name": "status_check_failed",              "cw_name": "StatusCheckFailed",            "stat": "Sum",     "unit": "count"},
+                    {"name": "memory_used_percent",              "cw_name": "MemoryUtilization",            "stat": "Average", "unit": "percent"},
+                    {"name": "disk_used_percent",                "cw_name": "DiskUtilization",              "stat": "Average", "unit": "percent"},
+                    {"name": "status_check_failed_instance",     "cw_name": "StatusCheckFailed_Instance",   "stat": "Sum",     "unit": "count"},
+                    {"name": "status_check_failed_system",       "cw_name": "StatusCheckFailed_System",     "stat": "Sum",     "unit": "count"},
                 ],
             },
             "rds": {
                 "namespace": "AWS/RDS",
                 "dimension_key": "DBInstanceIdentifier",
                 "definitions": [
-                    # ── Confirmed correct from CloudWatch debug (period=60s, matches console) ──
-                    # CPU: Average/60s → matches console exactly
-                    {"name": "cpu_utilization_percent",          "cw_name": "CPUUtilization",              "stat": "Average", "unit": "percent",  "period": 60},
-                    # Connections: Maximum/60s → 0.0 is correct (no active connections on this idle DB)
-                    {"name": "database_connections",             "cw_name": "DatabaseConnections",         "stat": "Maximum", "unit": "count",    "period": 60},
-                    # Free Storage: Average/60s → 19502764032 bytes (~18.16 GB) — stable value
-                    {"name": "free_storage_bytes",               "cw_name": "FreeStorageSpace",            "stat": "Average", "unit": "bytes",    "period": 60},
-                    # IOPS: Average/60s → ReadIOPS=0.0 (no reads), WriteIOPS=0.4
-                    {"name": "read_iops",                        "cw_name": "ReadIOPS",                    "stat": "Average", "unit": "count",    "period": 60},
-                    {"name": "write_iops",                       "cw_name": "WriteIOPS",                   "stat": "Average", "unit": "count",    "period": 60},
-                    # Latency: Average/60s → Read=0.0, Write=0.0005s
-                    {"name": "read_latency_seconds",             "cw_name": "ReadLatency",                 "stat": "Average", "unit": "seconds",  "period": 60},
-                    {"name": "write_latency_seconds",            "cw_name": "WriteLatency",                "stat": "Average", "unit": "seconds",  "period": 60},
-                    # Freeable Memory: Average/60s → 166174720 bytes (~158.4 MB)
-                    {"name": "freeable_memory_bytes",            "cw_name": "FreeableMemory",              "stat": "Average", "unit": "bytes",    "period": 60},
-                    # Network: Average/60s → Receive=1010 B/s, Transmit=11129 B/s
-                    {"name": "network_receive_bytes_per_sec",    "cw_name": "NetworkReceiveThroughput",    "stat": "Average", "unit": "bytes",    "period": 60},
-                    {"name": "network_transmit_bytes_per_sec",   "cw_name": "NetworkTransmitThroughput",   "stat": "Average", "unit": "bytes",    "period": 60},
-                    # Swap: Average/60s → 135053312 bytes (~128.8 MB)
-                    {"name": "swap_usage_bytes",                 "cw_name": "SwapUsage",                   "stat": "Average", "unit": "bytes",    "period": 60},
-                    # Disk Queue: Average/60s → 0.0004
-                    {"name": "disk_queue_depth",                 "cw_name": "DiskQueueDepth",              "stat": "Average", "unit": "count",    "period": 60},
-                    # Burst Balance: Average/60s → 100.0%
-                    {"name": "burst_balance_percent",            "cw_name": "BurstBalance",                "stat": "Average", "unit": "percent",  "period": 60},
-                    # BinLog: only populated on replicas with binary logging enabled
-                    {"name": "binlog_disk_usage_bytes",          "cw_name": "BinLogDiskUsage",             "stat": "Average", "unit": "bytes",    "period": 60},
-                    # Replica Lag: NO DATA on this primary MySQL instance — correct, not a replica
-                    # Both ReplicaLag and AuroraBinlogReplicaLag return empty for primary instances.
-                    # They will show data only when this DB has read replicas.
-                    {"name": "replica_lag_seconds",              "cw_name": "ReplicaLag",                  "stat": "Average", "unit": "seconds",  "period": 60},
-                    {"name": "replica_lag_aurora_seconds",       "cw_name": "AuroraBinlogReplicaLag",      "stat": "Average", "unit": "seconds",  "period": 60},
+                    {"name": "cpu_utilization_percent",          "cw_name": "CPUUtilization",               "stat": "Average", "unit": "percent",  "period": 300},
+                    {"name": "database_connections",             "cw_name": "DatabaseConnections",          "stat": "Maximum", "unit": "count",    "period": 300},
+                    {"name": "free_storage_bytes",               "cw_name": "FreeStorageSpace",             "stat": "Average", "unit": "bytes",    "period": 300},
+                    {"name": "read_iops",                        "cw_name": "ReadIOPS",                     "stat": "Average", "unit": "count",    "period": 300},
+                    {"name": "write_iops",                       "cw_name": "WriteIOPS",                    "stat": "Average", "unit": "count",    "period": 300},
+                    {"name": "read_latency_seconds",             "cw_name": "ReadLatency",                  "stat": "Average", "unit": "seconds",  "period": 300},
+                    {"name": "write_latency_seconds",            "cw_name": "WriteLatency",                 "stat": "Average", "unit": "seconds",  "period": 300},
+                    {"name": "freeable_memory_bytes",            "cw_name": "FreeableMemory",               "stat": "Average", "unit": "bytes",    "period": 300},
+                    {"name": "network_receive_bytes_per_sec",    "cw_name": "NetworkReceiveThroughput",     "stat": "Average", "unit": "bytes",    "period": 300},
+                    {"name": "network_transmit_bytes_per_sec",   "cw_name": "NetworkTransmitThroughput",    "stat": "Average", "unit": "bytes",    "period": 300},
+                    {"name": "swap_usage_bytes",                 "cw_name": "SwapUsage",                    "stat": "Average", "unit": "bytes",    "period": 300},
+                    {"name": "disk_queue_depth",                 "cw_name": "DiskQueueDepth",               "stat": "Average", "unit": "count",    "period": 300},
+                    {"name": "burst_balance_percent",            "cw_name": "BurstBalance",                 "stat": "Average", "unit": "percent",  "period": 300},
+                    {"name": "binlog_disk_usage_bytes",          "cw_name": "BinLogDiskUsage",              "stat": "Average", "unit": "bytes",    "period": 300},
+                    {"name": "replica_lag_seconds",              "cw_name": "ReplicaLag",                   "stat": "Average", "unit": "seconds",  "period": 300},
+                    {"name": "replica_lag_aurora_seconds",       "cw_name": "AuroraBinlogReplicaLag",       "stat": "Average", "unit": "seconds",  "period": 300},
                 ],
             },
             "lambda": {
                 "namespace": "AWS/Lambda",
                 "dimension_key": "FunctionName",
                 "definitions": [
-                    {"name": "invocations_total",                "cw_name": "Invocations",                 "stat": "Sum",     "unit": "count"},
-                    {"name": "errors_total",                     "cw_name": "Errors",                      "stat": "Sum",     "unit": "count"},
-                    {"name": "duration_avg_ms",                  "cw_name": "Duration",                    "stat": "Average", "unit": "ms"},
-                    {"name": "duration_max_ms",                  "cw_name": "Duration",                    "stat": "Maximum", "unit": "ms"},
-                    {"name": "concurrent_executions",            "cw_name": "ConcurrentExecutions",        "stat": "Maximum", "unit": "count"},
-                    {"name": "throttles_total",                  "cw_name": "Throttles",                   "stat": "Sum",     "unit": "count"},
-                    {"name": "iterator_age_ms",                  "cw_name": "IteratorAge",                 "stat": "Maximum", "unit": "ms"},
-                    {"name": "init_duration_ms",                 "cw_name": "InitDuration",                "stat": "Average", "unit": "ms"},
-                    {"name": "unreserved_concurrent_executions", "cw_name": "UnreservedConcurrentExecutions","stat":"Maximum","unit": "count"},
+                    {"name": "invocations_total",                "cw_name": "Invocations",                  "stat": "Sum",     "unit": "count"},
+                    {"name": "errors_total",                     "cw_name": "Errors",                       "stat": "Sum",     "unit": "count"},
+                    {"name": "duration_avg_ms",                  "cw_name": "Duration",                     "stat": "Average", "unit": "ms"},
+                    {"name": "duration_max_ms",                  "cw_name": "Duration",                     "stat": "Maximum", "unit": "ms"},
+                    {"name": "concurrent_executions",            "cw_name": "ConcurrentExecutions",         "stat": "Maximum", "unit": "count"},
+                    {"name": "throttles_total",                  "cw_name": "Throttles",                    "stat": "Sum",     "unit": "count"},
+                    {"name": "iterator_age_ms",                  "cw_name": "IteratorAge",                  "stat": "Maximum", "unit": "ms"},
+                    {"name": "init_duration_ms",                 "cw_name": "InitDuration",                 "stat": "Average", "unit": "ms"},
+                    {"name": "unreserved_concurrent_executions", "cw_name": "UnreservedConcurrentExecutions","stat": "Maximum","unit": "count"},
                 ],
             },
             "elb": {
                 "namespace": "AWS/ApplicationELB",
                 "dimension_key": "LoadBalancer",
                 "definitions": [
-                    {"name": "request_count",                    "cw_name": "RequestCount",                "stat": "Sum",     "unit": "count"},
-                    {"name": "target_response_time_s",           "cw_name": "TargetResponseTime",          "stat": "Average", "unit": "seconds"},
-                    {"name": "http_2xx_count",                   "cw_name": "HTTPCode_Target_2XX_Count",   "stat": "Sum",     "unit": "count"},
-                    {"name": "http_4xx_count",                   "cw_name": "HTTPCode_Target_4XX_Count",   "stat": "Sum",     "unit": "count"},
-                    {"name": "http_5xx_count",                   "cw_name": "HTTPCode_Target_5XX_Count",   "stat": "Sum",     "unit": "count"},
-                    {"name": "active_connections",               "cw_name": "ActiveConnectionCount",       "stat": "Sum",     "unit": "count"},
-                    {"name": "healthy_host_count",               "cw_name": "HealthyHostCount",            "stat": "Average", "unit": "count"},
-                    {"name": "unhealthy_host_count",             "cw_name": "UnHealthyHostCount",          "stat": "Average", "unit": "count"},
-                    {"name": "processed_bytes",                  "cw_name": "ProcessedBytes",              "stat": "Sum",     "unit": "bytes"},
+                    {"name": "request_count",                    "cw_name": "RequestCount",                 "stat": "Sum",     "unit": "count"},
+                    {"name": "target_response_time_s",           "cw_name": "TargetResponseTime",           "stat": "Average", "unit": "seconds"},
+                    {"name": "http_2xx_count",                   "cw_name": "HTTPCode_Target_2XX_Count",    "stat": "Sum",     "unit": "count"},
+                    {"name": "http_4xx_count",                   "cw_name": "HTTPCode_Target_4XX_Count",    "stat": "Sum",     "unit": "count"},
+                    {"name": "http_5xx_count",                   "cw_name": "HTTPCode_Target_5XX_Count",    "stat": "Sum",     "unit": "count"},
+                    {"name": "active_connections",               "cw_name": "ActiveConnectionCount",        "stat": "Sum",     "unit": "count"},
+                    {"name": "healthy_host_count",               "cw_name": "HealthyHostCount",             "stat": "Average", "unit": "count"},
+                    {"name": "unhealthy_host_count",             "cw_name": "UnHealthyHostCount",           "stat": "Average", "unit": "count"},
+                    {"name": "processed_bytes",                  "cw_name": "ProcessedBytes",               "stat": "Sum",     "unit": "bytes"},
                 ],
             },
             "dynamodb": {
                 "namespace": "AWS/DynamoDB",
                 "dimension_key": "TableName",
                 "definitions": [
-                    {"name": "consumed_read_capacity",           "cw_name": "ConsumedReadCapacityUnits",   "stat": "Sum",     "unit": "count"},
-                    {"name": "consumed_write_capacity",          "cw_name": "ConsumedWriteCapacityUnits",  "stat": "Sum",     "unit": "count"},
-                    {"name": "request_latency_ms",               "cw_name": "SuccessfulRequestLatency",    "stat": "Average", "unit": "ms"},
-                    {"name": "throttled_requests",               "cw_name": "ThrottledRequests",           "stat": "Sum",     "unit": "count"},
-                    {"name": "system_errors",                    "cw_name": "SystemErrors",                "stat": "Sum",     "unit": "count"},
-                    {"name": "user_errors",                      "cw_name": "UserErrors",                  "stat": "Sum",     "unit": "count"},
-                    {"name": "provisioned_read_capacity",        "cw_name": "ProvisionedReadCapacityUnits","stat": "Average", "unit": "count"},
-                    {"name": "provisioned_write_capacity",       "cw_name": "ProvisionedWriteCapacityUnits","stat":"Average", "unit": "count"},
-                    {"name": "returned_item_count",              "cw_name": "ReturnedItemCount",           "stat": "Sum",     "unit": "count"},
+                    {"name": "consumed_read_capacity",           "cw_name": "ConsumedReadCapacityUnits",    "stat": "Sum",     "unit": "count",   "period": 300},
+                    {"name": "consumed_write_capacity",          "cw_name": "ConsumedWriteCapacityUnits",   "stat": "Sum",     "unit": "count",   "period": 300},
+                    {"name": "request_latency_ms",               "cw_name": "SuccessfulRequestLatency",     "stat": "Average", "unit": "ms",      "period": 300},
+                    {"name": "throttled_requests",               "cw_name": "ThrottledRequests",            "stat": "Sum",     "unit": "count",   "period": 300},
+                    {"name": "system_errors",                    "cw_name": "SystemErrors",                 "stat": "Sum",     "unit": "count",   "period": 300},
+                    {"name": "user_errors",                      "cw_name": "UserErrors",                   "stat": "Sum",     "unit": "count",   "period": 300},
+                    {"name": "provisioned_read_capacity",        "cw_name": "ProvisionedReadCapacityUnits", "stat": "Average", "unit": "count",   "period": 300},
+                    {"name": "provisioned_write_capacity",       "cw_name": "ProvisionedWriteCapacityUnits","stat": "Average", "unit": "count",   "period": 300},
+                    {"name": "returned_item_count",              "cw_name": "ReturnedItemCount",            "stat": "Sum",     "unit": "count",   "period": 300},
                 ],
             },
         }
@@ -234,8 +233,9 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
                     for fn in page["Functions"]:
                         found.append({
                             "cloud": "aws", "region": region, "type": "lambda",
-                            "id":      fn["FunctionArn"],
+                            "id":      fn["FunctionName"],
                             "name":    fn["FunctionName"],
+                            "arn":     fn["FunctionArn"],
                             "runtime": fn.get("Runtime", ""),
                         })
             except Exception as exc:
@@ -305,25 +305,89 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
     def _cw_dim_value(self, resource: Dict) -> str:
         rtype = resource["type"]
         if rtype == "elb":
-            arn = resource.get("id", "")
-            return arn.split(":loadbalancer/")[-1] if ":loadbalancer/" in arn else arn
+            arn    = resource.get("id", "")
+            prefix = "loadbalancer/"
+            idx    = arn.find(prefix)
+            return arn[idx + len(prefix):] if idx != -1 else arn
         if rtype in ("lambda", "rds", "dynamodb"):
             return resource.get("name", resource.get("id", ""))
         return resource.get("id", "")
 
-    def _collect_region_metrics(self, region: str, resources: List[Dict],
-                                 start: datetime, end: datetime) -> List[MetricPoint]:
-        # RDS metrics with 300s period need at least a 30-min window to guarantee
-        # at least 2 data points are available regardless of collection timing.
-        # For all other resource types 15 min is sufficient.
-        has_rds = any(r["type"] == "rds" for r in resources)
-        min_window = 30 if has_rds else 15
-        effective_start = end - timedelta(minutes=max(self._lookback_min, min_window))
+    @staticmethod
+    def _aggregate(values: List[float], stat: str) -> float:
+        """
+        Aggregate all data points in the window according to the CloudWatch stat.
+        FIX: Previously picked only the single most-recent data point.
+        """
+        if not values:
+            return 0.0
+        if stat == "Sum":
+            return sum(values)
+        if stat == "Maximum":
+            return max(values)
+        if stat == "Minimum":
+            return min(values)
+        return sum(values) / len(values)
+
+    # ── PATCH #4: Timestamp Handling ──────────────────────────────────────────
+    @staticmethod
+    def _ensure_iso_timestamp(ts: Any) -> str:
+        """
+        Convert any timestamp format to ISO 8601.
+        
+        Handles:
+        - datetime objects → .isoformat()
+        - Unix timestamps (int/float) → parse to datetime
+        - ISO strings → validate and return
+        
+        Returns:
+            ISO 8601 string (e.g., "2026-04-09T06:32:00+00:00")
+        
+        Raises:
+            ValueError: If timestamp format cannot be determined
+        """
+        # Already ISO string?
+        if isinstance(ts, str):
+            if "T" in ts:
+                if "+00:00" in ts or "Z" in ts or ts.endswith("Z"):
+                    return ts.replace("Z", "+00:00")
+            raise ValueError(f"String timestamp not ISO 8601: {ts}")
+        
+        # Unix timestamp (seconds or milliseconds)?
+        if isinstance(ts, (int, float)):
+            ts_s = ts / 1000 if ts > 1e10 else ts
+            dt = datetime.fromtimestamp(ts_s, tz=timezone.utc)
+            return dt.isoformat()
+        
+        # datetime object?
+        if hasattr(ts, "isoformat") and callable(ts.isoformat):
+            result = ts.isoformat()
+            if "+" not in result and "Z" not in result:
+                result += "+00:00"
+            return result
+        
+        raise ValueError(f"Cannot parse timestamp: {ts!r} (type: {type(ts).__name__})")
+
+    def _collect_region_metrics(
+        self,
+        region: str,
+        resources: List[Dict],
+        start: datetime,
+        end: datetime,
+    ) -> List[MetricPoint]:
         cw = self._session.client("cloudwatch", region_name=region)
         metrics:    List[MetricPoint] = []
         queries:    List[Dict]        = []
         query_meta: Dict[str, Tuple]  = {}
         queries_by_type: Dict[str, int] = {}
+
+        _default_period: Dict[str, int] = {
+            "ec2":      60,
+            "lambda":   60,
+            "elb":      60,
+            "rds":      300,
+            "dynamodb": 300,
+        }
 
         for res in resources:
             rtype   = res["type"]
@@ -334,13 +398,10 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
                 continue
             dim_val = self._cw_dim_value(res)
             ns      = cfg.get("namespace", "AWS/EC2")
+            default_period = _default_period.get(rtype, 60)
 
             for mdef in defs:
-                qid = f"q{len(queries)}"
-                # Use per-metric period if defined, else:
-                #   EC2/Lambda/ELB: 60s (high-res metrics exist)
-                #   RDS/DynamoDB:   300s (basic monitoring only publishes every 5 min)
-                default_period = 60  # 60s period confirmed correct for all resource types
+                qid    = f"q{len(queries)}"
                 period = mdef.get("period", default_period)
                 queries.append({
                     "Id": qid,
@@ -355,10 +416,17 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
                     },
                     "ReturnData": True,
                 })
-                query_meta[qid] = (res, mdef)
+                query_meta[qid] = (res, mdef, period)
                 queries_by_type[rtype] = queries_by_type.get(rtype, 0) + 1
 
         logger.info(f"[AWS/{region}] Query plan: {queries_by_type}  (total={len(queries)})")
+
+        if queries:
+            max_period_s = max(q["MetricStat"]["Period"] for q in queries)
+        else:
+            max_period_s = 60
+        min_window_s   = max(max_period_s * 2, self._lookback_min * 60)
+        effective_start = end - timedelta(seconds=min_window_s)
 
         results_by_type: Dict[str, int] = {}
         empty_by_type:   Dict[str, int] = {}
@@ -368,11 +436,13 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
             if not batch_q:
                 continue
             try:
-                resp = self._retry(lambda bq=batch_q: cw.get_metric_data(
-                    MetricDataQueries=bq,
-                    StartTime=effective_start,
-                    EndTime=end,
-                ))
+                resp = self._retry(
+                    lambda bq=batch_q: cw.get_metric_data(
+                        MetricDataQueries=bq,
+                        StartTime=effective_start,
+                        EndTime=end,
+                    )
+                )
             except Exception as exc:
                 logger.warning(f"[AWS/{region}] GetMetricData failed: {exc}")
                 continue
@@ -380,12 +450,14 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
             all_results = list(resp.get("MetricDataResults", []))
             while resp.get("NextToken"):
                 try:
-                    resp = self._retry(lambda nt=resp["NextToken"], bq=batch_q: cw.get_metric_data(
-                        MetricDataQueries=bq,
-                        StartTime=effective_start,
-                        EndTime=end,
-                        NextToken=nt,
-                    ))
+                    resp = self._retry(
+                        lambda nt=resp["NextToken"], bq=batch_q: cw.get_metric_data(
+                            MetricDataQueries=bq,
+                            StartTime=effective_start,
+                            EndTime=end,
+                            NextToken=nt,
+                        )
+                    )
                     all_results.extend(resp.get("MetricDataResults", []))
                 except Exception as exc:
                     logger.warning(f"[AWS/{region}] Pagination failed: {exc}")
@@ -398,21 +470,31 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
                     tsts = result.get("Timestamps", [])
                     if rid not in query_meta:
                         continue
-                    res, mdef = query_meta[rid]
+                    res, mdef, _period = query_meta[rid]
                     rtype = res["type"]
                     if not vals:
                         empty_by_type[rtype] = empty_by_type.get(rtype, 0) + 1
                         continue
-                    idx    = tsts.index(max(tsts))
-                    ts     = tsts[idx]
-                    ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+
+                    aggregated_value = self._aggregate(vals, mdef["stat"])
+
+                    ts = max(tsts)
+                    try:
+                        ts_str = self._ensure_iso_timestamp(ts)
+                    except (ValueError, TypeError) as e:
+                        logger.warning(
+                            f"[AWS/{region}] Bad timestamp {ts!r} for {res['name']}/{mdef['name']}: {e}. "
+                            f"Using current time."
+                        )
+                        ts_str = datetime.now(timezone.utc).isoformat()
+
                     metrics.append(MetricPoint(
                         timestamp=ts_str,
                         cloud="aws", region=region,
                         resource_type=rtype,
                         resource_id=res["id"], resource_name=res["name"],
                         metric_name=mdef["name"],
-                        metric_value=round(float(vals[idx]), 6),
+                        metric_value=round(float(aggregated_value), 6),
                         metric_unit=mdef["unit"],
                         labels={k: str(v) for k, v in res.items()
                                 if k not in ("cloud", "region", "type", "id", "name", "tags")},
@@ -438,13 +520,13 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
 
         for region, _res_list in by_region.items():
             try:
-                cw_logs   = self._session.client("logs", region_name=region)
+                cw_logs    = self._session.client("logs", region_name=region)
                 log_groups: List[Dict] = []
-                for page in cw_logs.get_paginator("describe_log_groups").paginate():
+
+                for page in cw_logs.get_paginator("describe_log_groups").paginate(
+                    PaginationConfig={"MaxItems": self._max_log_groups}
+                ):
                     log_groups.extend(page["logGroups"])
-                    if len(log_groups) >= self._max_log_groups:
-                        break
-                log_groups = log_groups[: self._max_log_groups]
 
                 for lg in log_groups:
                     lg_name  = lg["logGroupName"]

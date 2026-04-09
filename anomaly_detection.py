@@ -1,68 +1,7 @@
 """
 anomaly_detection.py  —  AIOps-grade Multi-Algorithm Detector
                           Single-file-per-algorithm continuous training
-
-CHANGELOG:
-  v1-v6: See inline comments.
-
-  v7 FALSE-POSITIVE FIXES (Prophet model drift + negative forecasts):
-    FP-BUG-4  Prophet stale model blowup: PROPHET_MAX_AGE_HOURS → 6h,
-              model-drift eviction when yhat > PROPHET_IMPLAUSIBLE_FACTOR× mean.
-    FP-BUG-5  Negative Prophet forecasts: _clamp_forecast() clamps yhat/bounds to 0
-              for non-negative metrics.
-    FP-BUG-6  IsoForest absolute-value blindness: raised ISOFOREST_MIN_PCT_DEVIATION
-              to 20%, added ISOFOREST_MIN_ABS_DEVIATION gate.
-    FP-BUG-7  Prophet network deviation too sensitive: per-metric PROPHET_MIN_PCT_DEVIATION.
-
-  v8 CLAMP DIVISION-BY-ZERO FIXES:
-    NEW-BUG-1 _clamp_forecast() sets yhat=0 when Prophet drifts negative.
-              _detect_prophet() then computed pct_off = current / max(|0|, 1e-9)
-              = current / 1e-9 → astronomically large % (e.g. 337100800000000000%).
-              These fired as CRITICAL even though the real deviation was normal.
-              Fix: _detect_prophet() now uses training_mean as the percentage
-              denominator whenever clamped yhat == 0. A dedicated helper
-              _safe_pct_off() encapsulates the logic cleanly.
-
-    NEW-BUG-2 PROPHET_IMPLAUSIBLE_FACTOR=10 was too lenient: freeable_memory
-              forecast jumped to 930M from a ~490M baseline (1.9×), which is
-              clearly wrong but < 10× threshold so eviction never fired.
-              Fix: lowered PROPHET_IMPLAUSIBLE_FACTOR default from 10 → 3.
-              Also added a second eviction condition: evict if
-              |yhat - training_mean| > PROPHET_IMPLAUSIBLE_ABS_FACTOR × training_std
-              (default 5×). This catches absolute drift independently of the
-              mean-ratio check, covering cases where the mean is near zero
-              (ratios blow up) or where mean is large but std is tight.
-
-    NEW-BUG-3 swap_usage_bytes policy was "high only" in v7, so the row-14
-              warning (swap 151M, 1.3% above forecast 149M) was correct but
-              the v7 policy would have suppressed low alerts. Kept high-only
-              policy but added explicit note: this is intentional for swap.
-
-    CLEANUP   Removed dead _direction_ok() duplicate (was defined twice in v6).
-              Unified all direction checks through _direction_severity().
-
-  v9 MISSED-DETECTION FIXES (100% CPU not detected):
-    MISS-BUG-1  Metric name mismatch: collector may store metrics as
-                "CPUUtilization", "cpu_percent", "cpu_usage_percent" etc.
-                while detector policies key on "cpu_utilization_percent".
-                Hard limits, policies, z-score all silently skip misnamed
-                metrics. Fix: added _METRIC_NAME_ALIASES dict and
-                _normalize_metric_name() applied to every row before
-                the detection pipeline.
-
-    MISS-BUG-2  STALE_THRESHOLD_MINUTES=5 too tight: any SQLite writer lag
-                > 5 min causes get_all_active_metrics() to filter ALL metrics
-                and return an empty list. Increased default to 15 minutes
-                (still env-overridable via STALE_THRESHOLD_MINUTES).
-
-    MISS-BUG-3  No safety-net for extreme CPU: if normalization somehow fails,
-                added _detect_high_cpu_safety_net() as Layer 0 that fires
-                CRITICAL for any metric whose canonical or raw name contains
-                "cpu" and whose value >= CPU_SAFETY_NET_THRESHOLD (default 95).
-
-    MISS-BUG-4  Improved diagnostic logging: run_detection() now logs a sample
-                of the active metric names seen so metric-name mismatches are
-                immediately visible in the log.
+                          UPDATED: All patches applied (v2)
 """
 from __future__ import annotations
 from rca.engine import RCAEngine
@@ -71,7 +10,7 @@ import copy
 import json
 import logging
 import os
-import sqlite3x
+import sqlite3
 import statistics
 import threading
 import time
@@ -130,34 +69,37 @@ LOOKBACK_HOURS          = int(os.getenv("LOOKBACK_HOURS",           "2"))
 MIN_DATAPOINTS          = int(os.getenv("MIN_DATA_POINTS",          "8"))
 WARMUP_MINUTES          = int(os.getenv("WARMUP_MINUTES",           "3"))
 MODEL_DIR               = os.getenv("MODEL_DIR",                    "models")
-# MISS-BUG-2 fix: increased default from 5 → 15 minutes so SQLite writer
-# lag doesn't silently filter all metrics from detection.
 STALE_THRESHOLD_MINUTES = int(os.getenv("STALE_THRESHOLD_MINUTES",  "15"))
 DEDUP_WINDOW_MINUTES    = int(os.getenv("DEDUP_WINDOW_MINUTES",     "5"))
 DETECTION_WORKERS       = int(os.getenv("DETECTION_WORKERS",        "8"))
-
-# MISS-BUG-3 fix: safety-net threshold for raw CPU value (any metric name
-# containing "cpu"). Set to 95 so 100% CPU always fires even if aliases miss.
 CPU_SAFETY_NET_THRESHOLD = float(os.getenv("CPU_SAFETY_NET_THRESHOLD", "95.0"))
+
+# ── PATCH #1: RCA Configuration ───────────────────────────────────────────────
+RCA_ENABLED = os.getenv("RCA_ENABLED", "true").lower() == "true"
+RCA_REPORT_DIR = os.getenv("RCA_REPORT_DIR", "rca_reports/")
+RCA_TIMEOUT_SECONDS = int(os.getenv("RCA_TIMEOUT_SECONDS", "30"))
+RCA_MAX_ANOMALIES_PER_CYCLE = int(os.getenv("RCA_MAX_ANOMALIES_PER_CYCLE", "5"))
 
 # IsoForest
 ISOFOREST_RETRAIN_THRESHOLD   = float(os.getenv("ISOFOREST_RETRAIN_THRESHOLD",   "0.10"))
 ISOFOREST_WINDOW_HOURS        = int(os.getenv("ISOFOREST_WINDOW_HOURS",          "24"))
 ISOFOREST_MAX_AGE_HOURS       = int(os.getenv("ISOFOREST_MAX_AGE_HOURS",         "6"))
-ISOFOREST_MIN_PCT_DEVIATION   = float(os.getenv("ISOFOREST_MIN_PCT_DEVIATION",   "20.0"))
+ISOFOREST_MIN_PCT_DEVIATION   = float(os.getenv("ISOFOREST_MIN_PCT_DEVIATION",   "25.0"))
 ISOFOREST_MIN_SCORE_THRESHOLD = float(os.getenv("ISOFOREST_MIN_SCORE_THRESHOLD", "-0.70"))
 ISOFOREST_MIN_ABS_DEVIATION   = float(os.getenv("ISOFOREST_MIN_ABS_DEVIATION",   "0.0"))
+
+# False-positive suppression
+MIN_STD_FLOOR                 = float(os.getenv("MIN_STD_FLOOR", "0.001"))
+TRANSIENT_SUPPRESSION_PCT     = float(os.getenv("TRANSIENT_SUPPRESSION_PCT", "7.5"))
+TRANSIENT_SUPPRESSION_ABS     = float(os.getenv("TRANSIENT_SUPPRESSION_ABS", "0.05"))
 
 # Prophet
 PROPHET_RETRAIN_THRESHOLD      = float(os.getenv("PROPHET_RETRAIN_THRESHOLD",      "0.20"))
 PROPHET_WINDOW_HOURS           = int(os.getenv("PROPHET_WINDOW_HOURS",             "168"))
 PROPHET_MAX_AGE_HOURS          = int(os.getenv("PROPHET_MAX_AGE_HOURS",            "6"))
-# NEW-BUG-2 fix: lowered from 10 → 3
 PROPHET_IMPLAUSIBLE_FACTOR     = float(os.getenv("PROPHET_IMPLAUSIBLE_FACTOR",     "3.0"))
-# NEW-BUG-2 fix: also evict if |yhat - mean| > N × std  (0 = disabled)
 PROPHET_IMPLAUSIBLE_ABS_FACTOR = float(os.getenv("PROPHET_IMPLAUSIBLE_ABS_FACTOR", "5.0"))
 
-# Per-metric minimum % deviation from yhat before Prophet fires.
 _PROPHET_MIN_PCT_DEVIATION_DEFAULT: Dict[str, float] = {
     "network_transmit_bytes_per_sec":  15.0,
     "network_receive_bytes_per_sec":   15.0,
@@ -177,7 +119,22 @@ try:
 except Exception:
     PROPHET_MIN_PCT_DEVIATION = dict(_PROPHET_MIN_PCT_DEVIATION_DEFAULT)
 
-RIVER_SCORE_THRESHOLD = float(os.getenv("RIVER_SCORE_THRESHOLD", "0.65"))
+RIVER_SCORE_THRESHOLD = float(os.getenv("RIVER_SCORE_THRESHOLD", "0.75"))
+
+# ── PATCH #7: Unified Deduplication Logic ─────────────────────────────────────
+_DEDUP_WINDOW_BY_ALGORITHM: Dict[str, int] = {
+    "always_bad": 30,          # Non-zero is incident; avoid storm
+    "hard_limit": 30,          # Hard thresholds rarely fluctuate
+    "cpu_safety_net": 5,       # Safety net fires rarely; quick recovery
+    "prophet": 5,              # Time-series forecast is fine-grained
+    "isolation_forest": 5,     # Outlier detection is frequent
+    "river": 5,                # Online learning adapts quickly
+    "zscore": 5,               # Basic stats are snapshot-based
+}
+
+def _get_dedup_minutes(algorithm: str) -> int:
+    """Return deduplication window for anomaly algorithm."""
+    return _DEDUP_WINDOW_BY_ALGORITHM.get(algorithm, DEDUP_WINDOW_MINUTES)
 
 PROPHET_INTERNAL_MIN_ROWS = 20
 ISOFOREST_MIN_MINS        = 30
@@ -186,15 +143,13 @@ STD_FLOOR_PCT             = 0.10
 
 _NO_SUPPRESS_ALGOS: Set[str] = {"hard_limit", "always_bad", "cpu_safety_net"}
 
-# ── MISS-BUG-1 fix: Metric name normalisation ─────────────────────────────────
-# Maps every known collector/provider variant → canonical detector name.
-# Add new entries here whenever a new collector or cloud provider is added.
+# ── Metric name normalisation ─────────────────────────────────────────────────
 _METRIC_NAME_ALIASES: Dict[str, str] = {
     # CPU
     "CPUUtilization":                      "cpu_utilization_percent",
     "cpu_usage_percent":                   "cpu_utilization_percent",
     "cpu_percent":                         "cpu_utilization_percent",
-    "cpu_usage_idle":                      "cpu_utilization_percent",   # inverted; handled below
+    "cpu_usage_idle":                      "cpu_utilization_percent",
     "node_cpu_seconds_total":              "cpu_utilization_percent",
     "cpu_utilization":                     "cpu_utilization_percent",
     "system_cpu_usage":                    "cpu_utilization_percent",
@@ -302,34 +257,25 @@ _METRIC_NAME_ALIASES: Dict[str, str] = {
 
 
 def _normalize_metric_name(raw: str) -> str:
-    """
-    MISS-BUG-1 fix: return the canonical metric name for a raw collector name.
-    Falls back to the raw name (lowercased, spaces→underscores) if no alias found.
-    """
+    """Return the canonical metric name for a raw collector name."""
     if raw in _METRIC_NAME_ALIASES:
         return _METRIC_NAME_ALIASES[raw]
-    # Try case-insensitive match
     raw_lower = raw.lower()
     for alias, canonical in _METRIC_NAME_ALIASES.items():
         if alias.lower() == raw_lower:
             return canonical
-    # Gentle normalisation: lowercase + underscores
     return raw_lower.replace(" ", "_").replace("-", "_")
 
 
 def _normalize_row(row: dict) -> dict:
-    """
-    Return a shallow copy of row with metric_name normalised.
-    Also handles inverted metrics (e.g. cpu_usage_idle → 100 - value).
-    """
+    """Return a shallow copy of row with metric_name normalised."""
     raw_name = row.get("metric_name", "")
     canonical = _normalize_metric_name(raw_name)
 
     new_row = dict(row)
     new_row["metric_name"]     = canonical
-    new_row["_raw_metric_name"] = raw_name   # preserve for logging
+    new_row["_raw_metric_name"] = raw_name
 
-    # Special inversion: cpu_usage_idle is (100 - utilisation)
     if raw_name.lower() in ("cpu_usage_idle", "cpu_idle_percent"):
         try:
             new_row["metric_value"] = 100.0 - float(row["metric_value"])
@@ -367,14 +313,40 @@ def _clamp_forecast(
     return yhat, yhat_lower, yhat_upper
 
 
-def _safe_pct_off(current: float, yhat: float, training_mean: float) -> float:
+# ── PATCH #3: Safe Percentage Deviation ───────────────────────────────────────
+def _safe_pct_off(
+    current: float, yhat: float, training_mean: float,
+    abs_threshold: float = 1e-3
+) -> float:
     """
-    NEW-BUG-1 fix: compute percentage deviation safely.
-    When yhat has been clamped to 0 use training_mean as reference.
+    Compute percentage deviation safely.
+    
+    Handles three cases:
+    1. Normal: yhat is meaningful → use as denominator
+    2. Clamped: yhat = 0 but training_mean > threshold → use training_mean
+    3. Edge case: both near-zero → return 0 (no meaningful deviation)
+    
+    Args:
+        current: Current metric value
+        yhat: Forecast value (may have been clamped to 0)
+        training_mean: Historical average
+        abs_threshold: Minimum absolute value to consider "meaningful"
+    
+    Returns:
+        Percentage deviation (0-100+), or 0 if both ref values are near-zero
     """
-    ref = yhat if abs(yhat) >= 1e-6 else training_mean
-    if abs(ref) < 1e-9:
-        return 0.0
+    # Try forecast first, fall back to training mean
+    ref = yhat if abs(yhat) >= abs_threshold else training_mean
+    
+    # If reference is still near-zero, both are too small to compute meaningful %
+    if abs(ref) < abs_threshold:
+        # Return large % if current is significant, else 0
+        return (
+            (abs(current) / abs_threshold * 100)
+            if abs(current) >= abs_threshold * 10
+            else 0.0
+        )
+    
     return abs(current - yhat) / abs(ref) * 100
 
 
@@ -394,8 +366,8 @@ class _MetricPolicy:
 _METRIC_POLICY: Dict[str, _MetricPolicy] = {
     "network_packets_in":               _MetricPolicy(True,  True,  "critical", "critical", low_near_zero_only=True),
     "network_packets_out":              _MetricPolicy(True,  True,  "critical", "critical", low_near_zero_only=True),
-    "network_in_bytes":                 _MetricPolicy(True,  True,  "critical", "critical", low_near_zero_only=True),
-    "network_out_bytes":                _MetricPolicy(True,  True,  "critical", "critical", low_near_zero_only=True),
+    "network_in_bytes":                 _MetricPolicy(True,  False, "critical", "warning"),
+    "network_out_bytes":                _MetricPolicy(True,  False, "critical", "warning"),
     "network_receive_bytes_per_sec":    _MetricPolicy(True,  True,  "critical", "critical", low_near_zero_only=True),
     "network_transmit_bytes_per_sec":   _MetricPolicy(True,  True,  "critical", "critical", low_near_zero_only=True),
     "cpu_utilization_percent":          _MetricPolicy(True,  True,  "critical", "warning",  low_pct_threshold=70.0),
@@ -476,12 +448,12 @@ _DEFAULT_METRIC_SENSITIVITY: Dict[str, float] = {
     "concurrent_executions": 2.0,    "unreserved_concurrent_executions": 2.0,
 }
 _DEFAULT_HARD_LIMITS: Dict[str, Tuple[Optional[float], Optional[float]]] = {
-    "burst_balance_percent":            (10.0,           None),
+    "burst_balance_percent":            (5.0,           None),
     "healthy_host_count":               (1.0,            None),
     "concurrent_executions":            (None,           800.0),
     "unreserved_concurrent_executions": (None,           800.0),
     "cpu_utilization_percent":          (None,           90.0),
-    "freeable_memory_bytes":            (100_000_000,    None),
+    "freeable_memory_bytes":            (50_000_000,    None),
     "free_storage_bytes":               (1_073_741_824,  None),
     "replica_lag_seconds":              (None,           30.0),
     "read_latency_seconds":             (None,           1.0),
@@ -538,9 +510,47 @@ def _to_df(history_rows: List[Tuple[str, float]]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def _warmup_ok(history_rows: List[Tuple[str, float]]) -> Tuple[bool, str]:
-    if len(history_rows) < MIN_DATAPOINTS:
-        return False, f"only {len(history_rows)}/{MIN_DATAPOINTS} pts"
+# ── PATCH #6: Metric-specific minimum datapoints ──────────────────────────────
+def _metric_min_datapoints(metric_name: str) -> int:
+    """
+    Return minimum datapoints required for warmup, per metric type.
+    
+    Network metrics are naturally sparse (not every interval has packets).
+    Status checks are binary (0 or >0), so need fewer points.
+    Other metrics collect frequently and need more history.
+    """
+    return {
+        # Network: sparse by nature
+        "network_packets_in": 2,
+        "network_packets_out": 2,
+        "network_in_bytes": 2,
+        "network_out_bytes": 2,
+        # Status checks: binary, need fewer
+        "status_check_failed": 1,
+        "status_check_failed_instance": 1,
+        "status_check_failed_system": 1,
+        # Always-bad: non-zero is failure
+        "throttles_total": 1,
+        "errors_total": 1,
+        # Default: require more history
+    }.get(metric_name, MIN_DATAPOINTS)
+
+
+def _warmup_ok(
+    history_rows: List[Tuple[str, float]], metric_name: str = None
+) -> Tuple[bool, str]:
+    """
+    Check if metric has enough historical data for statistical analysis.
+    
+    Different metrics have different requirements:
+    - Network packets: 2 points (sparse collector)
+    - Status checks: 1 point (binary, state is immediately informative)
+    - Others: 8 points (default, for robust std dev estimation)
+    """
+    min_pts = _metric_min_datapoints(metric_name) if metric_name else MIN_DATAPOINTS
+    
+    if len(history_rows) < min_pts:
+        return False, f"only {len(history_rows)}/{min_pts} pts"
     now = datetime.now(timezone.utc)
     try:
         oldest = _parse_ts(history_rows[0][0])
@@ -576,7 +586,7 @@ def _is_stale(latest_at: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MODEL REGISTRY
+# MODEL REGISTRY (PATCH #5: Thread-safe cache)
 # ═══════════════════════════════════════════════════════════════════════════════
 class ModelRegistry:
     def __init__(self, model_dir: str = MODEL_DIR) -> None:
@@ -626,7 +636,7 @@ class ModelRegistry:
         }
         self._save_meta(meta)
 
-    # ── IsolationForest ────────────────────────────────────────────────────────
+    # ── IsolationForest (PATCH #5: Thread-safe) ───────────────────────────────
     def save_isoforest(
         self, model: IsolationForest, metric_stats: Dict[str, Dict[str, float]],
         metric_id_map: Dict[str, float], data_size: int, last_ts: str,
@@ -639,20 +649,24 @@ class ModelRegistry:
         log.info(f"[Registry] isoforest saved ({data_size} pts / {len(metric_stats)} metrics)")
 
     def load_isoforest(self) -> Tuple[Optional[IsolationForest], Dict, Dict]:
-        if "isoforest" in self._cache:
-            p = self._cache["isoforest"]
-            return p["model"], p["metric_stats"], p.get("metric_id_map", {})
-        if not self._iso_path.exists():
-            return None, {}, {}
-        try:
-            p = joblib.load(self._iso_path)
-            self._cache["isoforest"] = p
-            return p["model"], p["metric_stats"], p.get("metric_id_map", {})
-        except Exception as e:
-            log.warning(f"[Registry] Corrupt isoforest: {e}")
-            return None, {}, {}
+        """Load IsoForest model with thread-safe cache."""
+        with self._iso_lock:
+            if "isoforest" in self._cache:
+                p = self._cache["isoforest"]
+                return p["model"], p["metric_stats"], p.get("metric_id_map", {})
+            
+            if not self._iso_path.exists():
+                return None, {}, {}
+            
+            try:
+                p = joblib.load(self._iso_path)
+                self._cache["isoforest"] = p
+                return p["model"], p["metric_stats"], p.get("metric_id_map", {})
+            except Exception as e:
+                log.warning(f"[Registry] Corrupt isoforest: {e}")
+                return None, {}, {}
 
-    # ── Prophet ────────────────────────────────────────────────────────────────
+    # ── Prophet (PATCH #5: Thread-safe) ──────────────────────────────────────
     def evict_prophet_series(self, resource_id: str, metric_name: str) -> None:
         key = f"{resource_id}::{metric_name}"
         with self._prophet_lock:
@@ -679,17 +693,21 @@ class ModelRegistry:
         log.info(f"[Registry] prophet saved — {key} ({len(d)} series)")
 
     def load_prophet_all(self) -> Dict[str, Any]:
-        if "prophet" in self._cache:
-            return copy.deepcopy(self._cache["prophet"])
-        if not self._prophet_path.exists():
-            return {}
-        try:
-            d = joblib.load(self._prophet_path)
-            self._cache["prophet"] = d
-            return copy.deepcopy(d)
-        except Exception as e:
-            log.warning(f"[Registry] Corrupt prophet: {e}")
-            return {}
+        """Load all Prophet models with thread-safe cache."""
+        with self._prophet_lock:
+            if "prophet" in self._cache:
+                return copy.deepcopy(self._cache["prophet"])
+            
+            if not self._prophet_path.exists():
+                return {}
+            
+            try:
+                d = joblib.load(self._prophet_path)
+                self._cache["prophet"] = d
+                return copy.deepcopy(d)
+            except Exception as e:
+                log.warning(f"[Registry] Corrupt prophet: {e}")
+                return {}
 
     def load_prophet_series(
         self, resource_id: str, metric_name: str
@@ -697,7 +715,7 @@ class ModelRegistry:
         entry = self.load_prophet_all().get(f"{resource_id}::{metric_name}")
         return (entry["model"], entry) if entry else (None, None)
 
-    # ── River ──────────────────────────────────────────────────────────────────
+    # ── River (PATCH #5: Thread-safe) ───────────────────────────────────────
     def save_river(self, model: Any, data_size: int, last_ts: str) -> None:
         with self._river_lock_save:
             self._atomic_save(self._river_path, model)
@@ -705,17 +723,21 @@ class ModelRegistry:
             self._cache["river"] = model
 
     def load_river(self) -> Optional[Any]:
-        if "river" in self._cache:
-            return self._cache["river"]
-        if not self._river_path.exists():
-            return None
-        try:
-            m = joblib.load(self._river_path)
-            self._cache["river"] = m
-            return m
-        except Exception as e:
-            log.warning(f"[Registry] Corrupt river: {e}")
-            return None
+        """Load River model with thread-safe cache."""
+        with self._river_lock_save:
+            if "river" in self._cache:
+                return self._cache["river"]
+            
+            if not self._river_path.exists():
+                return None
+            
+            try:
+                m = joblib.load(self._river_path)
+                self._cache["river"] = m
+                return m
+            except Exception as e:
+                log.warning(f"[Registry] Corrupt river: {e}")
+                return None
 
     def needs_retrain(
         self, algo: str, current_data_size: int,
@@ -751,7 +773,6 @@ class ContinuousTrainer:
         self._river_dirty: bool = False
         self._river_lock  = threading.Lock()
 
-    # ── IsolationForest ────────────────────────────────────────────────────────
     def maybe_retrain_isoforest(
         self, all_training_data: Dict[str, List[Tuple[str, float]]],
     ) -> None:
@@ -843,7 +864,6 @@ class ContinuousTrainer:
             log.debug(f"[IsoForest] score failed {metric_name}: {e}")
             return 1, 0.0
 
-    # ── Prophet ────────────────────────────────────────────────────────────────
     def maybe_retrain_prophet(
         self, resource_id: str, metric_name: str,
         history_rows: List[Tuple[str, float]], sens: float,
@@ -866,7 +886,7 @@ class ContinuousTrainer:
             except Exception:
                 pass
 
-        # NEW-BUG-2 fix: dual eviction gate
+        # Dual eviction gate for drift detection
         if existing_model is not None:
             try:
                 training_mean = float(df["y"].mean())
@@ -952,7 +972,6 @@ class ContinuousTrainer:
             log.warning(f"[Prophet] Retrain failed {resource_id}::{metric_name}: {e}")
             return existing_model
 
-    # ── River ──────────────────────────────────────────────────────────────────
     def get_or_create_river(self) -> Optional[Any]:
         if not RIVER_AVAILABLE:
             return None
@@ -1175,7 +1194,6 @@ class MetricsReader:
 
         result = [dict(r) for r in rows]
 
-        # MISS-BUG-2: log staleness details so operators can see what's filtered
         active = []
         stale_names: List[str] = []
         for r in result:
@@ -1222,7 +1240,6 @@ class MetricsReader:
                 rows = cur.fetchall()
         result: Dict[str, List[Tuple[str, float]]] = {}
         for r in rows:
-            # MISS-BUG-1: normalise metric names in history bulk too so keys match
             canonical = _normalize_metric_name(r[1])
             result.setdefault(f"{r[0]}::{canonical}", []).append((r[2], float(r[3])))
         return result
@@ -1230,6 +1247,11 @@ class MetricsReader:
     def get_history(
         self, resource_id: str, metric_name: str, hours: int = LOOKBACK_HOURS
     ) -> List[Tuple[str, float]]:
+        """
+        Fetch metric history, normalizing metric_name aliases.
+        IMPORTANT: Matches both raw metric names and their canonical forms
+        to handle collector variant names (e.g. CPUUtilization → cpu_utilization_percent).
+        """
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
         canonical = _normalize_metric_name(metric_name)
         if self._backend == "sqlite":
@@ -1282,7 +1304,6 @@ class MetricsReader:
                 rows = cur.fetchall()
         result: Dict[str, List[Tuple[str, float]]] = {}
         for r in rows:
-            # MISS-BUG-1: normalise metric names in training data too
             canonical = _normalize_metric_name(r[1])
             result.setdefault(f"{r[0]}::{canonical}", []).append((r[2], float(r[3])))
         return result
@@ -1338,21 +1359,62 @@ class MetricsReader:
                 self._conn.commit()
 
 
+# ── PATCH #8: Data Quality Assessment ─────────────────────────────────────────
+def _assess_data_quality(
+    all_metrics: List[dict],
+    history_2h: Dict[str, List[Tuple[str, float]]],
+) -> Dict[str, int]:
+    """
+    Assess data quality across all metrics.
+    
+    Returns counts of:
+    - zero_values: Metrics with value=0 (may indicate dead sensor)
+    - single_point: Metrics with only 1 historical datapoint
+    - missing_history: Metrics with no history in 2h window
+    - nan_inf: Metrics with NaN/Inf values
+    """
+    issues = {
+        "zero_values": 0,
+        "single_point": 0,
+        "missing_history": 0,
+        "nan_inf": 0,
+        "negative_non_negative": 0,
+    }
+    
+    for r in all_metrics:
+        key = f"{r['resource_id']}::{r['metric_name']}"
+        hist = history_2h.get(key, [])
+        try:
+            val = float(r["metric_value"])
+        except (ValueError, TypeError):
+            issues["nan_inf"] += 1
+            continue
+        
+        # Detect bad values
+        if not (-1e15 < val < 1e15):
+            issues["nan_inf"] += 1
+        elif r["metric_name"] in _NON_NEGATIVE_METRICS and val < 0:
+            issues["negative_non_negative"] += 1
+        elif val == 0.0 and "count" not in r["metric_name"].lower():
+            issues["zero_values"] += 1
+        
+        # Detect missing history
+        if not hist:
+            issues["missing_history"] += 1
+        elif len(hist) == 1:
+            issues["single_point"] += 1
+    
+    return issues
+
+
 # ── Detection layers ──────────────────────────────────────────────────────────
 
 def _detect_high_cpu_safety_net(
     row: dict, history_rows: List[Tuple[str, float]], now_str: str,
 ) -> Optional[Anomaly]:
     """
-    MISS-BUG-3 fix: Layer 0 safety net.
-
-    If any metric whose name contains "cpu" (raw or canonical) has a value
-    >= CPU_SAFETY_NET_THRESHOLD, fire CRITICAL unconditionally.  This fires
-    even if the metric-name alias lookup produced no canonical match, ensuring
-    100% CPU never slips through silently.
-
-    Uses algorithm="cpu_safety_net" which is in _NO_SUPPRESS_ALGOS so it
-    will not be deduped by the normal 5-minute window.
+    Layer 0 safety net: If any metric whose name contains "cpu" has a value
+    >= CPU_SAFETY_NET_THRESHOLD, fire CRITICAL unconditionally.
     """
     raw_name = row.get("_raw_metric_name", row.get("metric_name", ""))
     canonical = row["metric_name"]
@@ -1402,7 +1464,7 @@ def _detect_river(
     current = float(row["metric_value"])
     values  = [v for _, v in history_rows]
     avg     = statistics.mean(values) if values else 0.0
-    std     = statistics.stdev(values) if len(values) > 1 else 1e-9
+    std     = statistics.stdev(values) if len(values) > 1 else MIN_STD_FLOOR
 
     sev = _direction_severity(row["metric_name"], current, avg)
     if sev is None:
@@ -1416,8 +1478,18 @@ def _detect_river(
         last_ts=history_rows[-1][0] if history_rows else now_str,
     )
     if score >= RIVER_SCORE_THRESHOLD:
-        std_floor = max(std, abs(avg) * STD_FLOOR_PCT, 1e-9)
-        pct_off   = abs(current - avg) / max(abs(avg), 1e-9) * 100
+        std_floor = max(std, abs(avg) * STD_FLOOR_PCT, MIN_STD_FLOOR)
+        lower_bound = max(0.0, avg - sens * std_floor)
+        upper_bound = avg + sens * std_floor
+        if lower_bound <= current <= upper_bound:
+            log.debug(
+                f"[River/HST] Suppressed because {row['metric_name']} is inside z-score bounds"
+            )
+            return None
+        if _suppress_transient_spike(history_rows, current, avg, lower_bound, upper_bound, row["metric_name"]):
+            log.debug(f"[River/HST] Suppressed transient spike for {row['metric_name']}")
+            return None
+        pct_off   = abs(current - avg) / max(abs(avg), MIN_STD_FLOOR) * 100
         final_sev = "critical" if score > 0.9 else sev
         return Anomaly(
             detected_at=now_str, cloud=row["cloud"], region=row["region"],
@@ -1442,10 +1514,7 @@ def _detect_prophet(
     training_rows: List[Tuple[str, float]], sens: float,
     now_str: str, trainer: ContinuousTrainer,
 ) -> Optional[Anomaly]:
-    """
-    NEW-BUG-1 fix: percentage deviation computed via _safe_pct_off() which
-    uses training_mean as fallback denominator when yhat has been clamped to 0.
-    """
+    """PATCH #3: Uses safe percentage deviation calculation."""
     m = trainer.maybe_retrain_prophet(row["resource_id"], row["metric_name"], training_rows, sens)
     if m is None:
         return None
@@ -1473,10 +1542,9 @@ def _detect_prophet(
         if not (above_upper or below_lower):
             return None
 
-        # NEW-BUG-1 fix: safe pct_off using training_avg as fallback denominator
+        # PATCH #3: Safe pct_off using training_avg as fallback denominator
         pct_off = _safe_pct_off(current, yhat, training_avg)
 
-        # Per-metric minimum % deviation gate
         min_pct = PROPHET_MIN_PCT_DEVIATION.get(metric_name, 0.0)
         if pct_off < min_pct:
             log.debug(
@@ -1529,9 +1597,10 @@ def _detect_isoforest(
     values    = [v for _, v in history_rows]
     avg       = statistics.mean(values) if values else 0.0
     std       = statistics.stdev(values) if len(values) > 1 else 0.0
-    std_floor = max(std, abs(avg) * STD_FLOOR_PCT, 1e-9)
-    pct_off   = abs(current - avg) / max(abs(avg), 1e-9) * 100
+    std_floor = max(std, abs(avg) * STD_FLOOR_PCT, MIN_STD_FLOOR)
+    pct_off   = abs(current - avg) / max(abs(avg), MIN_STD_FLOOR) * 100
     abs_off   = abs(current - avg)
+    min_abs   = max(ISOFOREST_MIN_ABS_DEVIATION, _get_min_detection_delta(row["metric_name"], avg))
 
     if pct_off < ISOFOREST_MIN_PCT_DEVIATION:
         log.debug(f"[IsoForest] Suppressed pct {row['metric_name']}: {pct_off:.1f}%")
@@ -1539,8 +1608,11 @@ def _detect_isoforest(
     if score > ISOFOREST_MIN_SCORE_THRESHOLD:
         log.debug(f"[IsoForest] Suppressed score {row['metric_name']}: {score:.3f}")
         return None
-    if ISOFOREST_MIN_ABS_DEVIATION > 0.0 and abs_off < ISOFOREST_MIN_ABS_DEVIATION:
-        log.debug(f"[IsoForest] Suppressed abs {row['metric_name']}: {abs_off:.6f}")
+    if abs_off < min_abs:
+        log.debug(f"[IsoForest] Suppressed abs-too-small {row['metric_name']}: {abs_off:.6f} < {min_abs:.6f}")
+        return None
+    if _suppress_transient_spike(history_rows, current, avg, max(0.0, avg - sens * std_floor), avg + sens * std_floor, row["metric_name"]):
+        log.debug(f"[IsoForest] Suppressed transient spike for {row['metric_name']}")
         return None
 
     sev = _direction_severity(row["metric_name"], current, avg)
@@ -1565,6 +1637,45 @@ def _detect_isoforest(
         data_points=len(history_rows), algorithm="isolation_forest",
     )
 
+_METRIC_MIN_ABS_DEVIATION: Dict[str, float] = {
+    "write_latency_seconds":   0.005,
+    "read_latency_seconds":    0.005,
+    "disk_queue_depth":        0.05,
+    "read_iops":               5.0,
+    "write_iops":              5.0,
+    "cpu_utilization_percent": 15.0,
+    "network_in_bytes":        50_000,
+    "network_out_bytes":       50_000,
+}
+
+def _get_min_detection_delta(metric_name: str, avg: float) -> float:
+    return max(
+        _METRIC_MIN_ABS_DEVIATION.get(metric_name, 0.0),
+        abs(avg) * 0.005,
+        MIN_STD_FLOOR,
+    )
+
+
+def _suppress_transient_spike(
+    history_rows: List[Tuple[str, float]],
+    current: float,
+    avg: float,
+    lower_bound: float,
+    upper_bound: float,
+    metric_name: str,
+) -> bool:
+    if len(history_rows) < 2:
+        return False
+    prev = history_rows[-1][1]
+    if not (lower_bound <= prev <= upper_bound):
+        return False
+    delta = abs(current - prev)
+    threshold = max(
+        abs(avg) * TRANSIENT_SUPPRESSION_PCT / 100,
+        TRANSIENT_SUPPRESSION_ABS,
+        _get_min_detection_delta(metric_name, avg),
+    )
+    return delta <= threshold
 
 def _detect_zscore(
     row: dict, history_rows: List[Tuple[str, float]],
@@ -1592,14 +1703,22 @@ def _detect_zscore(
                 data_points=len(values), algorithm="zscore",
             )
         return None
-    std_floor   = max(std, abs(avg) * STD_FLOOR_PCT, 1e-9)
+    std_floor   = max(std, abs(avg) * STD_FLOOR_PCT, MIN_STD_FLOOR)
     upper_bound = avg + sens * std_floor
     lower_bound = max(0.0, avg - sens * std_floor)
+    if _suppress_transient_spike(history_rows, current, avg, lower_bound, upper_bound, row["metric_name"]):
+        log.debug(f"[Z-score] Suppressed transient spike for {row['metric_name']}")
+        return None
     if current > upper_bound or current < lower_bound:
         sev = _direction_severity(row["metric_name"], current, avg)
         if sev is None:
             return None
         deviation = abs(current - avg) / std_floor
+        min_abs = _get_min_detection_delta(row["metric_name"], avg)
+        if abs(current - avg) < min_abs:
+            log.debug(f"[Z-score] Suppressed abs-too-small {row['metric_name']}: "
+                    f"|{current:.4f} - {avg:.4f}| < {min_abs:.6f}")
+            return None
         if deviation > sens * 1.5:
             sev = "critical"
         direction = "ABOVE" if current > upper_bound else "BELOW"
@@ -1632,7 +1751,7 @@ def detect(
     now_str       = datetime.now(timezone.utc).isoformat()
     sens          = METRIC_SENSITIVITY.get(metric_name, SENSITIVITY)
 
-    # Layer 0: CPU safety net (MISS-BUG-3) — fires for ANY cpu-like metric >= threshold
+    # Layer 0: CPU safety net
     result = _detect_high_cpu_safety_net(row, history_rows, now_str)
     if result is not None:
         log.debug(
@@ -1681,7 +1800,7 @@ def detect(
         )
 
     # Layers 3-6 require warmup
-    ok, skip_reason = _warmup_ok(history_rows)
+    ok, skip_reason = _warmup_ok(history_rows, metric_name=metric_name)
     if not ok:
         log.debug(f"  WARMUP {row['resource_name']}/{metric_name}: {skip_reason}")
         return None
@@ -1753,6 +1872,30 @@ def send_slack(anomaly: Anomaly) -> None:
         threading.Thread(target=_send_slack_blocking, args=(anomaly,), daemon=True).start()
 
 
+# ── PATCH #1: RCA Integration with Error Handling ──────────────────────────────
+def _run_rca_async(anomaly: Anomaly, reader: MetricsReader) -> None:
+    """Run RCA in background thread with error handling."""
+    def _rca_worker():
+        try:
+            engine = RCAEngine("observability_data/metrics.db")
+            report = engine.run_rca(
+                trigger_resource_id=anomaly.resource_id,
+                trigger_metric=anomaly.metric_name,
+                trigger_time=anomaly.detected_at,
+                window_minutes=30,
+            )
+            os.makedirs(RCA_REPORT_DIR, exist_ok=True)
+            pdf_path = generate_pdf(report, output_dir=RCA_REPORT_DIR)
+            log.info(f"[RCA] Generated {pdf_path} for {anomaly.resource_name}::{anomaly.metric_name}")
+        except Exception as e:
+            log.warning(
+                f"[RCA] Failed for {anomaly.resource_id}::{anomaly.metric_name}: {e}"
+            )
+    
+    t = threading.Thread(target=_rca_worker, daemon=True)
+    t.start()
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Anomaly]:
     all_metrics_raw = reader.get_all_active_metrics()
@@ -1760,11 +1903,8 @@ def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Ano
         log.warning("No active metrics found. Is the collector running?")
         return []
 
-    # MISS-BUG-1 fix: normalise every metric row before detection.
-    # Log a sample of raw → canonical mappings for operator visibility.
     all_metrics = [_normalize_row(r) for r in all_metrics_raw]
 
-    # Diagnostic: log distinct raw→canonical name pairs so mismatches are obvious.
     name_pairs = {
         (r.get("_raw_metric_name", ""), r["metric_name"])
         for r in all_metrics
@@ -1784,9 +1924,16 @@ def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Ano
     history_2h   = reader.get_all_history_bulk(hours=LOOKBACK_HOURS)
     history_168h = reader.get_all_history_bulk(hours=PROPHET_WINDOW_HOURS)
 
+    # PATCH #8: Assess data quality
+    qa = _assess_data_quality(all_metrics, history_2h)
+    if any(qa.values()):
+        log.warning(f"[DataQA] Issues found: {qa}")
+        for issue, count in qa.items():
+            if count > 0:
+                log.warning(f"  {issue}: {count} metrics")
+
     log.info(f"Checking {len(all_metrics)} metric/resource combinations...")
 
-    # MISS-BUG-4: log sample of active metric names to help diagnose name issues
     distinct_canonical = sorted({r["metric_name"] for r in all_metrics})
     log.info(f"[Metrics] Distinct canonical names ({len(distinct_canonical)}): "
              f"{distinct_canonical[:20]}"
@@ -1802,7 +1949,6 @@ def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Ano
     def _check_one(row: dict) -> Tuple[dict, Optional[Anomaly]]:
         if row["metric_name"] in IGNORE_METRICS:
             return row, None
-        # Key uses canonical metric name (already normalised in row)
         key = f"{row['resource_id']}::{row['metric_name']}"
         return row, detect(
             row,
@@ -1822,7 +1968,7 @@ def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Ano
 
             if anomaly is None:
                 key = f"{row['resource_id']}::{row['metric_name']}"
-                ok, _ = _warmup_ok(history_2h.get(key, []))
+                ok, _ = _warmup_ok(history_2h.get(key, []), metric_name=row["metric_name"])
                 with counters_lock:
                     if not ok and row["metric_name"] not in ALWAYS_BAD_METRICS:
                         warming += 1
@@ -1830,16 +1976,12 @@ def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Ano
                         normal += 1
                 continue
 
-            if anomaly.algorithm not in _NO_SUPPRESS_ALGOS:
-                if reader.recent_anomaly_count(
-                    row["resource_id"], row["metric_name"],
-                    minutes=DEDUP_WINDOW_MINUTES,
-                ) > 0:
-                    log.debug(
-                        f"  Suppressed repeat [{anomaly.algorithm}]: "
-                        f"{row['resource_name']}/{row['metric_name']}"
-                    )
-                    continue
+            # PATCH #7: Unified deduplication logic
+            dedup_min = _get_dedup_minutes(anomaly.algorithm)
+            if reader.recent_anomaly_count(row["resource_id"], row["metric_name"],
+                                            minutes=dedup_min) > 0:
+                log.debug(f"  Dedup [{dedup_min}m]: {row['resource_id']}::{row['metric_name']}")
+                continue
 
             dedup_key = f"{row['resource_id']}::{row['metric_name']}"
             with found_lock:
@@ -1852,7 +1994,8 @@ def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Ano
 
     assign_correlation_ids(found)
 
-    for a in found:
+    # PATCH #1: RCA with error handling
+    for i, a in enumerate(found):
         log.warning(
             f"  ANOMALY [{a.severity.upper()}][{a.algorithm}] "
             f"{a.resource_type}/{a.resource_name} — "
@@ -1861,17 +2004,10 @@ def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Ano
             + (f" [corr:{a.correlation_id}]" if a.correlation_id else "")
         )
         reader.save_anomaly(a)
-        # In your anomaly_detection.py — after save_anomaly(a):
-
-        engine = RCAEngine("observability_data/metrics.db")
-        report = engine.run_rca(
-            trigger_resource_id=a.resource_id,
-            trigger_metric=a.metric_name,
-            trigger_time=a.detected_at,
-            window_minutes=30,
-        )
-        pdf_path = generate_pdf(report, output_dir="rca_reports/")
         send_slack(a)
+        
+        if RCA_ENABLED and i < RCA_MAX_ANOMALIES_PER_CYCLE:
+            _run_rca_async(a, reader)
 
     now_ts = datetime.now(timezone.utc).isoformat()
     trainer.flush_river(data_size=len(all_metrics), last_ts=now_ts)
@@ -1884,23 +2020,22 @@ def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Ano
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("=" * 70)
-    log.info("  AIOps Anomaly Detector — v9 (metric-name normalisation + CPU safety-net)")
+    log.info("  AIOps Anomaly Detector — v2 (all patches applied)")
     log.info(f"  Config          : {CONFIG_PATH}")
     log.info(f"  Model dir       : {MODEL_DIR}/")
     log.info(f"  Interval        : {INTERVAL}s")
-    log.info(f"  Warmup          : {WARMUP_MINUTES}m / {MIN_DATAPOINTS} pts")
-    log.info(f"  Stale skip      : {STALE_THRESHOLD_MINUTES}m (was 5m in v8)")
-    log.info(f"  Dedup window    : {DEDUP_WINDOW_MINUTES}m (statistical algos only)")
+    log.info(f"  Warmup          : {WARMUP_MINUTES}m / {MIN_DATAPOINTS} pts (metric-specific)")
+    log.info(f"  Stale skip      : {STALE_THRESHOLD_MINUTES}m")
+    log.info(f"  Dedup window    : metric-specific (5–30m per algorithm)")
     log.info(f"  Workers         : {DETECTION_WORKERS}")
     log.info(f"  CPU safety-net  : >= {CPU_SAFETY_NET_THRESHOLD}% → always CRITICAL")
+    log.info(f"  RCA             : {'enabled' if RCA_ENABLED else 'disabled'}")
     log.info(f"  IsoForest       : min_pct={ISOFOREST_MIN_PCT_DEVIATION}%, "
              f"min_abs={ISOFOREST_MIN_ABS_DEVIATION}, "
              f"score<={ISOFOREST_MIN_SCORE_THRESHOLD}, "
              f"window={ISOFOREST_WINDOW_HOURS}h")
     log.info(f"  Prophet         : {'on' if PROPHET_AVAILABLE else 'NOT installed'}, "
-             f"window={PROPHET_WINDOW_HOURS}h, max_age={PROPHET_MAX_AGE_HOURS}h, "
-             f"evict>{PROPHET_IMPLAUSIBLE_FACTOR}× mean OR "
-             f">{PROPHET_IMPLAUSIBLE_ABS_FACTOR}× std")
+             f"window={PROPHET_WINDOW_HOURS}h, max_age={PROPHET_MAX_AGE_HOURS}h")
     log.info(f"  River           : {'on' if RIVER_AVAILABLE else 'NOT installed'}, "
              f"threshold={RIVER_SCORE_THRESHOLD}")
     log.info(f"  Slack           : {'configured' if SLACK_WEBHOOK else 'NOT SET'}")
