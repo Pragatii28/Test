@@ -164,9 +164,13 @@ def main() -> None:
     from decision_engine import DecisionEngine
     decision_engine = DecisionEngine(CONFIG_PATH)
 
+    # ── Phase 5: Remediation Executor ─────────────────────────────────────────
+    from remediation_executor import RemediationExecutor
+    remediation_executor = RemediationExecutor(CONFIG_PATH)
+    decision_engine.remediation_executor = remediation_executor.execute_from_decision
+
     def _run_decision(rca_results):
         decisions = decision_engine.decide(rca_results)
-        # Mark decisions taken in RCA store
         for d in decisions:
             rca_store.mark_decision_taken(d.rca_id, d.outcome.value)
         return decisions

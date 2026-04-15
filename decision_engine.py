@@ -547,9 +547,38 @@ class DecisionEngine:
         # Invoke remediation executor if wired up (Phase 5)
         if self.remediation_executor is not None:
             try:
-                self.remediation_executor(playbook.playbook_id, d.parameters)
+                exec_params = {**d.parameters, "decision_id": d.decision_id}
+
+                remediation_result = self.remediation_executor(
+                    playbook.playbook_id, exec_params
+                )
+
+                self._store.record_execution(
+                    d.decision_id,
+                    json.dumps({
+                        "execution_id":              remediation_result.execution_id,
+                        "status":                    remediation_result.status,
+                        "action_taken":              remediation_result.action_taken,
+                        "elapsed_seconds":           remediation_result.elapsed_seconds,
+                        "validation_metric":         remediation_result.validation_metric,
+                        "validation_window_minutes": remediation_result.validation_window_minutes,
+                        "error_message":             remediation_result.error_message,
+                    }),
+                )
+
+                log.info(
+                    f"[DecisionEngine] Phase5 result: "
+                    f"status={remediation_result.status} | "
+                    f"action='{remediation_result.action_taken}' | "
+                    f"elapsed={remediation_result.elapsed_seconds:.1f}s"
+                )
+
             except Exception as e:
-                log.error(f"[DecisionEngine] Remediation executor failed: {e}", exc_info=True)
+                log.error(
+                    f"[DecisionEngine] Remediation executor raised: {e}",
+                    exc_info=True,
+                )
+                # Do NOT re-raise — a failed remediation must not crash the pipeline
 
         return d
 

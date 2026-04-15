@@ -16,7 +16,7 @@ log = logging.getLogger("rca.engine")
 # This file ONLY calls MCP if the client/tool is available.
 # It does not implement MCP server logic here.
 try:
-    from mcp_client import MCPClient  # expected external wrapper/client
+    from multi_cloud_collector.gemini_mcp_client import MCPClient
     MCP_CLIENT_AVAILABLE = True
 except Exception:
     MCPClient = None
@@ -85,11 +85,59 @@ class RCAEngine:
     Reads from your existing SQLite DB and produces a structured RCA report.
     Optional MCP enrichment can be applied on top of heuristic RCA.
     """
-
-    LOOKBACK_MINUTES = 30
-    LOOKAHEAD_MINUTES = 10
-    DEVIATION_THRESHOLD = 30.0
+    LOOKBACK_MINUTES = 10        # was 30 — too wide
+    LOOKAHEAD_MINUTES = 5        # was 10
+    DEVIATION_THRESHOLD = 50.0   # was 30 — too sensitive
     CORRELATION_DECAY = 0.05
+
+    # Add these:
+    MIN_CORRELATION_SCORE = 0.80  # only include in cascade if score >= this
+    MAX_CASCADE_RESOURCES = 5     # cap cascade list
+
+    EXCLUDED_RESOURCES = {        # never appear in any RCA
+        "anomaly_detector",
+        "Anomaly_detector",
+    }
+
+    METRIC_CATEGORIES = {
+        "cpu_utilization_percent":          "cpu",
+        "cpu_usage_percent":               "cpu",
+        "memory_used_percent":             "memory",
+        "freeable_memory_bytes":           "memory",
+        "memory_utilization_percent":      "memory",
+        "disk_read_bytes":                 "disk",
+        "disk_write_bytes":                "disk",
+        "disk_queue_depth":                "disk",
+        "disk_used_percent":               "disk",
+        "network_in_bytes":                "network",
+        "network_out_bytes":               "network",
+        "network_packets_in":              "network",
+        "network_packets_out":             "network",
+        "network_receive_bytes_per_sec":   "network",
+        "network_transmit_bytes_per_sec":  "network",
+        "database_connections":            "database",
+        "active_connections":              "network",
+        "request_count":                   "traffic",
+        "invocations_total":               "traffic",
+        "errors_total":                    "errors",
+        "user_errors":                     "errors",
+        "system_errors":                   "errors",
+        "http_5xx_count":                  "errors",
+        "http_4xx_count":                  "errors",
+        "status_check_failed":             "health",
+        "unhealthy_host_count":            "health",
+        "target_response_time_s":          "latency",
+        "duration_avg_ms":                 "latency",
+        "read_latency_seconds":            "latency",
+        "write_latency_seconds":           "latency",
+    }
+
+    # Absolute floors — don't flag if actual value is not dangerous
+    ABSOLUTE_FLOORS = {
+        "cpu_utilization_percent": 20.0,
+        "network_out_bytes":       1_000_000,
+        "network_in_bytes":        1_000_000,
+    }
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -108,6 +156,36 @@ class RCAEngine:
             except Exception as e:
                 log.warning(f"Failed to initialize MCP client: {e}")
                 self._mcp_client = None
+        
+        self._dep_cache: Dict[str, Set[str]] = {}
+
+    def _get_resource_deps(self, resource_id: str) -> Set[str]:
+        """Fetch discovered dependencies for a resource from labels in the DB."""
+        if resource_id in self._dep_cache:
+            return self._dep_cache[resource_id]
+
+        deps: Set[str] = set()
+        try:
+            # Query the latest metrics for this resource to get its labels/depends_on
+            sql = "SELECT labels FROM metrics WHERE resource_id = ? ORDER BY collected_at DESC LIMIT 1"
+            row = self._conn.execute(sql, (resource_id,)).fetchone()
+            if row and row["labels"]:
+                labels = json.loads(row["labels"])
+                # AWS collector stores these in 'depends_on' label
+                depends_on = labels.get("depends_on", "")
+                if depends_on:
+                    for d in depends_on.split(","):
+                        if d.strip():
+                            deps.add(d.strip())
+                # Also include VPC co-location if available
+                vpc_id = labels.get("vpc_id")
+                if vpc_id:
+                    deps.add(f"vpc:{vpc_id}")
+        except Exception as e:
+            log.warning(f"Error fetching deps for {resource_id}: {e}")
+
+        self._dep_cache[resource_id] = deps
+        return deps
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -408,7 +486,6 @@ class RCAEngine:
             return []
 
     # ── Analysis ───────────────────────────────────────────────────────────────
-
     def _find_candidates(
         self,
         all_metrics: List[sqlite3.Row],
@@ -417,8 +494,14 @@ class RCAEngine:
         trigger_resource_id: str,
         trigger_metric: str,
     ) -> List[CausalCandidate]:
+
+        trigger_category = self.METRIC_CATEGORIES.get(trigger_metric)
+
         series: Dict[str, List[sqlite3.Row]] = {}
         for r in all_metrics:
+            # ── EXCLUDE observer machine ──────────────────────────────────
+            if r["resource_name"] in self.EXCLUDED_RESOURCES:
+                continue
             key = f"{r['resource_id']}::{r['metric_name']}"
             series.setdefault(key, []).append(r)
 
@@ -431,23 +514,45 @@ class RCAEngine:
                 continue
 
             mean = baseline["mean"]
-            std = baseline["std"]
+            std  = baseline["std"]
             if mean == 0 and std == 0:
                 continue
 
+            # ── Absolute floor check — ignore dangerous-looking but safe values ──
+            floor = self.ABSOLUTE_FLOORS.get(metric_name)
+            latest_val = float(rows[-1]["metric_value"])
+            if floor and latest_val < floor:
+                continue
+
+            # ── Dependency-Aware Metric matching ──────────────────────────────────────────
+            candidate_category = self.METRIC_CATEGORIES.get(metric_name)
+            
+            # Heuristic bonus: same category candidates are naturally weighted higher,
+            # but we NO LONGER block cross-category analysis.
+            category_match = (trigger_category and candidate_category and 
+                             candidate_category == trigger_category)
+
             for row in rows:
                 val = float(row["metric_value"])
-                if mean != 0:
-                    dev_pct = abs(val - mean) / max(abs(mean), 1e-9) * 100
-                else:
-                    dev_pct = abs(val - mean) / max(std, 1e-9) * 100
+                dev_pct = abs(val - mean) / max(abs(mean), 1e-9) * 100
 
                 if dev_pct < self.DEVIATION_THRESHOLD:
                     continue
 
                 first_seen_dt = _parse_ts(row["collected_at"])
                 offset_sec = (trigger_dt - first_seen_dt).total_seconds()
-                corr = self._correlation_score(offset_sec, dev_pct)
+                
+                # Check for discoverable dependencies
+                is_dependency = False
+                dep_data = self._get_resource_deps(trigger_resource_id)
+                if resource_id in dep_data or resource_id in self._get_resource_deps(resource_id):
+                    is_dependency = True
+
+                corr = self._correlation_score(offset_sec, dev_pct, category_match, is_dependency)
+
+                # ── Score floor ───────────────────────────────────────────────────
+                if corr < self.MIN_CORRELATION_SCORE:
+                    continue   # not correlated enough
 
                 candidates.append(
                     CausalCandidate(
@@ -465,26 +570,34 @@ class RCAEngine:
                         correlation_score=corr,
                     )
                 )
-                break
+                break  # one candidate per resource::metric
 
         return candidates
 
-    def _correlation_score(self, offset_sec: float, dev_pct: float) -> float:
-        severity_factor = min(dev_pct / 100, 1.0)
+    def _correlation_score(self, offset_sec: float, dev_pct: float, category_match: bool = False, is_dependency: bool = False) -> float:
+        severity_factor = min(dev_pct / 1000, 1.0)
         minutes = offset_sec / 60.0
 
-        if minutes < 0:
-            time_factor = max(0, 1 - abs(minutes) * 0.15)
-        elif 0 <= minutes <= 5:
-            time_factor = 0.95
-        elif 5 < minutes <= 15:
+        if minutes < -2: # allow small buffer for clock skew
+            time_factor = max(0, 1 - abs(minutes) * 0.25)  # significantly penalty for happening AFTER trigger
+        elif -2 <= minutes <= 3:
+            time_factor = 0.95   # happened just before — very likely related
+        elif 3 < minutes <= 8:
             time_factor = 0.80
-        elif 15 < minutes <= 30:
+        elif 8 < minutes <= 15:
             time_factor = 0.60
         else:
-            time_factor = max(0.1, 0.6 - (minutes - 30) * self.CORRELATION_DECAY)
+            time_factor = 0.0    # anything > 15 min ago is NOT correlated
 
-        return round(min(severity_factor * 0.4 + time_factor * 0.6, 1.0), 3)
+        score = severity_factor * 0.35 + time_factor * 0.65
+        
+        # ── Dependency & Category Multipliers ───────────────────────────────────
+        if is_dependency:
+            score = min(1.0, score + 0.15)  # 15% bonus for known dependency link
+        if category_match:
+            score = min(1.0, score + 0.05)  # 5% bonus for same metric type
+            
+        return round(score, 3)
 
     def _rank_candidates(
         self,
@@ -494,22 +607,20 @@ class RCAEngine:
         if not candidates:
             return None, []
 
-        sorted_c = sorted(candidates, key=lambda c: c.correlation_score, reverse=True)
+        # Sort by score, then by time (earlier first when scores are tied)
+        sorted_c = sorted(candidates, key=lambda c: (-c.correlation_score, c.time_offset_seconds))
 
         root_cause = None
         effects: List[CausalCandidate] = []
 
+        # The root cause should be something that happened BEFORE or AT the trigger time
+        # but we also allow candidates that happened slightly after due to collection lag
         for c in sorted_c:
-            if c.time_offset_seconds > 0 and root_cause is None:
+            if root_cause is None:
                 root_cause = c
                 c.is_root_cause = True
             else:
                 effects.append(c)
-
-        if root_cause is None and sorted_c:
-            root_cause = sorted_c[0]
-            root_cause.is_root_cause = True
-            effects = sorted_c[1:]
 
         return root_cause, effects[:8]
 
@@ -621,10 +732,23 @@ class RCAEngine:
         trigger_name = trigger_row["resource_name"] if trigger_row else "unknown resource"
         trigger_metric = trigger_row["metric_name"] if trigger_row else "unknown metric"
 
-        if root_cause:
+        if root_cause and trigger_row:
+            # Check if this was a discovered dependency
+            trig_id = trigger_row["resource_id"]
+            is_dep = False
+            deps = self._get_resource_deps(trig_id)
+            if root_cause.resource_id in deps or root_cause.resource_id in self._get_resource_deps(root_cause.resource_id):
+                is_dep = True
+
             rc_desc = (
                 f"The analysis identified {root_cause.resource_name} ({root_cause.resource_type}) "
-                f"as the most likely root cause. Its {root_cause.metric_name} deviated "
+                f"as the most likely root cause."
+            )
+            if is_dep:
+                rc_desc += f" [Automatic Discovery: This resource is a known dependency of {trigger_name}]."
+            
+            rc_desc += (
+                f" Its {root_cause.metric_name} deviated "
                 f"{root_cause.deviation_pct:.0f}% from baseline approximately "
                 f"{abs(root_cause.time_offset_seconds / 60):.1f} minutes before the primary anomaly "
                 f"was triggered on {trigger_name}/{trigger_metric}."

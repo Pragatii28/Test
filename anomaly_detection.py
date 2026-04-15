@@ -1098,8 +1098,9 @@ class MetricsReader:
     _DDL_MIGRATE = [
         ("algorithm",      "TEXT NOT NULL DEFAULT 'zscore'"),
         ("correlation_id", "TEXT NOT NULL DEFAULT ''"),
+        ("status",         "TEXT NOT NULL DEFAULT 'active'"),   # ADD THIS
+        ("resolved_at",    "TEXT NOT NULL DEFAULT ''"),          # ADD THIS
     ]
-
     def __init__(self, config_path: str) -> None:
         with open(config_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
@@ -1271,6 +1272,57 @@ class MetricsReader:
                 )
                 rows = cur.fetchall()
         return [(r[0], float(r[1])) for r in rows]
+
+    def resolve_cleared_anomalies(self, history_2h: Dict[str, List[Tuple[str, float]]]) -> int:
+        """
+        For every active anomaly in the last 2h, check if current metric value
+        has returned inside the normal band. If yes, mark it resolved.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        now_str = datetime.now(timezone.utc).isoformat()
+
+        if self._backend == "sqlite":
+            active = self._conn.execute(
+                "SELECT id, resource_id, metric_name, lower_bound, upper_bound "
+                "FROM anomalies WHERE status='active' AND detected_at >= ?",
+                (cutoff,)
+            ).fetchall()
+        else:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, resource_id, metric_name, lower_bound, upper_bound "
+                    "FROM anomalies WHERE status='active' AND detected_at >= %s",
+                    (cutoff,)
+                )
+                active = cur.fetchall()
+
+        resolved_count = 0
+        for row in active:
+            key = f"{row[1]}::{row[2]}"
+            history = history_2h.get(key, [])
+            if not history:
+                continue
+            current_val = history[-1][1]
+            lower, upper = float(row[3]), float(row[4])
+            if lower <= current_val <= upper:
+                with self._write_lock:
+                    if self._backend == "sqlite":
+                        self._conn.execute(
+                            "UPDATE anomalies SET status='resolved', resolved_at=? WHERE id=?",
+                            (now_str, row[0])
+                        )
+                        self._conn.commit()
+                    else:
+                        with self._conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE anomalies SET status='resolved', resolved_at=%s WHERE id=%s",
+                                (now_str, row[0])
+                            )
+                        self._conn.commit()
+                resolved_count += 1
+                log.info(f"[Resolved] {row[1]}/{row[2]} back to normal ({current_val:.4f} in [{lower:.4f}, {upper:.4f}])")
+
+        return resolved_count
 
     def get_all_training_data(self, hours: int) -> Dict[str, List[Tuple[str, float]]]:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()

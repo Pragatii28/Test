@@ -165,7 +165,15 @@ async def main():
                     "metric_name": metric_name
                 }
             )
-
+            regional_context = await call_tool(
+                session,
+                "get_regional_context",
+                {
+                    "region": top_anomaly.get("region", ""),
+                    "trigger_resource_id": resource_id,
+                    "minutes": 10      # tight window
+                }
+            )
             confidence_data = await call_tool(
                 session,
                 "compute_confidence_score",
@@ -198,6 +206,14 @@ Return exactly these sections:
 4. Confidence Assessment
 5. Recommended Mitigation
 6. Auto-remediation Suitability
+7. Regional context (other anomalies in same region, last 10 minutes):
+{json.dumps(regional_context, indent=2, default=str)}
+
+IMPORTANT: Only treat another resource as a cascading effect if:
+1. Its metric is in the same category (CPU/network/disk) as the trigger
+2. Its anomaly started BEFORE the trigger resource's anomaly
+3. There is a plausible dependency between the two resources
+Do NOT include the monitoring tool itself (Anomaly_detector) in any analysis.
 
 Selected anomaly:
 {json.dumps(top_anomaly, indent=2, default=str)}

@@ -1112,8 +1112,12 @@ def get_anomalies():
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
 
     # Build WHERE clause
-    where  = ["detected_at >= ?"]
-    params = [cutoff]
+    where = [
+        "detected_at >= ?",
+        "(status = 'active' OR (status = 'resolved' AND resolved_at >= ?))"
+    ]
+    grace_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+    params = [cutoff, grace_cutoff]
     if severity:
         where.append("severity = ?")
         params.append(severity)

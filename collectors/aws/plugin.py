@@ -205,6 +205,8 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
                                 "name":  tags.get("Name", inst["InstanceId"]),
                                 "instance_type": inst.get("InstanceType", ""),
                                 "az":    inst.get("Placement", {}).get("AvailabilityZone", ""),
+                                "vpc_id": inst.get("VpcId", ""),
+                                "subnet_id": inst.get("SubnetId", ""),
                                 "tags":  tags,
                             })
             except Exception as exc:
@@ -222,6 +224,8 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
                                 "name": db["DBInstanceIdentifier"],
                                 "engine":         db.get("Engine", ""),
                                 "instance_class": db.get("DBInstanceClass", ""),
+                                "cluster_id":     db.get("DBClusterIdentifier", ""),
+                                "vpc_id":         db.get("DBSubnetGroup", {}).get("VpcId", ""),
                             })
             except Exception as exc:
                 logger.error(f"[AWS/{region}] RDS: {exc}")
@@ -231,12 +235,35 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
                 lam = self._session.client("lambda", region_name=region)
                 for page in lam.get_paginator("list_functions").paginate():
                     for fn in page["Functions"]:
+                        fn_name = fn["FunctionName"]
+                        
+                        # Fetch more details (VPC, Env vars)
+                        vpc_id = ""
+                        subnet_ids = ""
+                        depends_on = []
+                        try:
+                            config = lam.get_function_configuration(FunctionName=fn_name)
+                            vpc_cfg = config.get("VpcConfig", {})
+                            vpc_id = vpc_cfg.get("VpcId", "")
+                            subnet_ids = ",".join(vpc_cfg.get("SubnetIds", []))
+                            
+                            # Inspect env vars for dependency hints (e.g. DB_HOST, RDS_INSTANCE)
+                            env = config.get("Environment", {}).get("Variables", {})
+                            for k, v in env.items():
+                                if any(x in k.lower() for x in ["db", "host", "table", "queue", "topic"]):
+                                    depends_on.append(v)
+                        except Exception:
+                            pass
+
                         found.append({
                             "cloud": "aws", "region": region, "type": "lambda",
-                            "id":      fn["FunctionName"],
-                            "name":    fn["FunctionName"],
+                            "id":      fn_name,
+                            "name":    fn_name,
                             "arn":     fn["FunctionArn"],
                             "runtime": fn.get("Runtime", ""),
+                            "vpc_id":  vpc_id,
+                            "subnets": subnet_ids,
+                            "depends_on": ",".join(depends_on),
                         })
             except Exception as exc:
                 logger.error(f"[AWS/{region}] Lambda: {exc}")
@@ -244,14 +271,54 @@ class AWSCollectorPlugin(CloudCollectorPlugin):
         if not self._res_types or "elb_load_balancers" in self._res_types:
             try:
                 elb = self._session.client("elbv2", region_name=region)
+                ec2 = self._session.client("ec2", region_name=region)
+                
+                # First, get all Target Groups in region
+                target_groups = {}
+                try:
+                    for tg_page in elb.get_paginator("describe_target_groups").paginate():
+                        for tg in tg_page["TargetGroups"]:
+                            tg_arn = tg["TargetGroupArn"]
+                            # Find instances in this target group
+                            targets = []
+                            try:
+                                health = elb.describe_target_health(TargetGroupArn=tg_arn)
+                                for th in health["TargetHealthDescriptions"]:
+                                    if "Id" in th["Target"]:
+                                        targets.append(th["Target"]["Id"])
+                            except Exception:
+                                pass
+                            target_groups[tg_arn] = targets
+                except Exception as e:
+                    logger.warning(f"[AWS/{region}] Failed to fetch Target Groups: {e}")
+
                 for page in elb.get_paginator("describe_load_balancers").paginate():
                     for lb in page["LoadBalancers"]:
                         if lb["State"]["Code"] == "active":
+                            lb_arn = lb["LoadBalancerArn"]
+                            
+                            # Find which target groups are associated with this LB
+                            lb_targets = []
+                            try:
+                                listeners = elb.describe_listeners(LoadBalancerArn=lb_arn)
+                                for lis in listeners["Listeners"]:
+                                    lis_arn = lis["ListenerArn"]
+                                    rules = elb.describe_rules(ListenerArn=lis_arn)
+                                    for rule in rules["Rules"]:
+                                        for action in rule["Actions"]:
+                                            tg_arn = action.get("TargetGroupArn")
+                                            if tg_arn in target_groups:
+                                                lb_targets.extend(target_groups[tg_arn])
+                            except Exception:
+                                pass
+
                             found.append({
                                 "cloud": "aws", "region": region, "type": "elb",
-                                "id":      lb["LoadBalancerArn"],
+                                "id":      lb_arn,
                                 "name":    lb["LoadBalancerName"],
                                 "lb_type": lb.get("Type", "application"),
+                                "depends_on": ",".join(list(set(lb_targets))),
+                                "vpc_id": lb.get("VpcId", ""),
                             })
             except Exception as exc:
                 logger.error(f"[AWS/{region}] ELB: {exc}")

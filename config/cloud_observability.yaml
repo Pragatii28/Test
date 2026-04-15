@@ -127,4 +127,18 @@ anomaly_detection:
     isolation_forest: 5
     river: 5
     zscore: 5
+
+  tuning:
+    global_sensitivity: 3.0
+    min_std_floor: 0.5
+    algorithm_thresholds:
+      prophet: 0.1
+      isolation_forest: 0.005
+      river: 0.75
+    prophet_window_hours: 48
+    isolation_forest_window_hours: 24
+    prophet_max_age_hours: 1
+    metric_overrides:
+      network_in_bytes: 0.1
+      network_out_bytes: 0.1
   
