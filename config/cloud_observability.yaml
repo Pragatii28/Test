@@ -6,8 +6,7 @@
 clouds:
   aws:
     enabled: true
-    access_key_id: ""
-    secret_access_key: ""
+
     regions:
       - us-east-1
       - eu-north-1
@@ -24,6 +23,8 @@ clouds:
     logs_lookback_minutes: 15
     max_log_groups: 20
     max_log_events_per_group: 50
+    "node_exporter_via_ssm": True,
+    "ssm_timeout_seconds":   120,
 
   azure:
     enabled: false

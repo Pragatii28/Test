@@ -1975,6 +1975,11 @@ def run_detection(reader: MetricsReader, trainer: ContinuousTrainer) -> List[Ano
     log.info("Fetching bulk history (2h + 168h windows)...")
     history_2h   = reader.get_all_history_bulk(hours=LOOKBACK_HOURS)
     history_168h = reader.get_all_history_bulk(hours=PROPHET_WINDOW_HOURS)
+    # ── NEW: Auto-resolve anomalies that returned to normal ──────────────────
+    resolved_count = reader.resolve_cleared_anomalies(history_2h)
+    if resolved_count:
+        log.info(f"[AutoResolve] {resolved_count} anomaly/anomalies resolved (back in normal range)")
+    # ─────────────────────────────────────────────────────────────────────────
 
     # PATCH #8: Assess data quality
     qa = _assess_data_quality(all_metrics, history_2h)

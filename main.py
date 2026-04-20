@@ -123,6 +123,14 @@ def run_cycle(
 
 def main() -> None:
     cfg = _load_config()
+
+    # Load AWS credentials into environment variables so boto3 uses them
+    aws_cfg = cfg.get("clouds", {}).get("aws", {})
+    if aws_cfg.get("access_key_id"):
+        os.environ["AWS_ACCESS_KEY_ID"] = aws_cfg["access_key_id"]
+    if aws_cfg.get("secret_access_key"):
+        os.environ["AWS_SECRET_ACCESS_KEY"] = aws_cfg["secret_access_key"]
+
     dry_run_flag = "DRY RUN" if os.getenv("DECISION_DRY_RUN", "true").lower() != "false" else "LIVE"
 
     log.info("=" * 70)
@@ -135,8 +143,9 @@ def main() -> None:
 
     # ── Phase 1: Orchestrator ─────────────────────────────────────────────────
     from orchestrator import MultiCloudOrchestrator
+    from collectors.aws.ssm_auto_attach import ensure_ssm_profile_attached_to_all_instances
     orchestrator = MultiCloudOrchestrator(CONFIG_PATH)
-
+    ensure_ssm_profile_attached_to_all_instances()
     # ── Phase 2: Anomaly detection ────────────────────────────────────────────
     from anomaly_detection import (
         MetricsReader, ModelRegistry, ContinuousTrainer,

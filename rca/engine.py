@@ -157,14 +157,14 @@ class RCAEngine:
                 log.warning(f"Failed to initialize MCP client: {e}")
                 self._mcp_client = None
         
-        self._dep_cache: Dict[str, Set[str]] = {}
+        self._dep_cache: Dict[str, set[str]] = {}
 
-    def _get_resource_deps(self, resource_id: str) -> Set[str]:
+    def _get_resource_deps(self, resource_id: str) -> set[str]:
         """Fetch discovered dependencies for a resource from labels in the DB."""
         if resource_id in self._dep_cache:
             return self._dep_cache[resource_id]
 
-        deps: Set[str] = set()
+        deps: set[str] = set()
         try:
             # Query the latest metrics for this resource to get its labels/depends_on
             sql = "SELECT labels FROM metrics WHERE resource_id = ? ORDER BY collected_at DESC LIMIT 1"

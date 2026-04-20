@@ -1,43 +1,50 @@
 """
 collectors/models.py
 ────────────────────
-Shared, cloud-agnostic data models used across all plugins.
-No cloud SDK types leak into this file.
+Shared data models for all collector plugins.
 """
 from __future__ import annotations
-
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 @dataclass
 class MetricPoint:
-    timestamp:     str
-    cloud:         str          # "aws" | "azure" | "gcp"
-    region:        str
-    resource_type: str          # e.g. "ec2", "virtual_machine", "gce_instance"
-    resource_id:   str
+    timestamp: str
+    cloud: str
+    region: str
+    resource_type: str
+    resource_id: str
     resource_name: str
-    metric_name:   str          # normalised snake_case name
-    metric_value:  float
-    metric_unit:   str
-    labels:        Dict[str, str] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict:
-        return {"pillar": "metrics", **self.__dict__}
+    metric_name: str
+    metric_value: float
+    metric_unit: str
+    labels: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class LogEntry:
-    timestamp:     str
-    cloud:         str
-    region:        str
+    timestamp: str
+    cloud: str
+    region: str
     resource_type: str
-    resource_id:   str
+    resource_id: str
     resource_name: str
-    log_level:     str
-    message:       str
-    labels:        Dict[str, Any] = field(default_factory=dict)
+    log_level: str
+    message: str
+    labels: Dict[str, str] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict:
-        return {"pillar": "logs", **self.__dict__}
+
+@dataclass
+class HealthScore:
+    """Rolled-up health signal per resource for the remediation engine."""
+    timestamp: str
+    cloud: str
+    region: str
+    resource_type: str
+    resource_id: str
+    resource_name: str
+    score: float          # 0.0 (critical) → 1.0 (healthy)
+    status: str           # "healthy" | "degraded" | "critical"
+    signals: Dict[str, Any] = field(default_factory=dict)   # contributing metrics
+    labels: Dict[str, str]  = field(default_factory=dict)
