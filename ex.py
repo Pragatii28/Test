@@ -18,8 +18,8 @@ from unified_collector import UnifiedCollector
 config = {
     "aws": {
         # Credentials — leave empty to use IAM role / env vars
-        "access_key_id":     os.getenv("AWS_ACCESS_KEY_ID", "AKIA5MPLW57ZJ3UQRYPP"),
-        "secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "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"),
+        "access_key_id":     os.getenv("AWS_ACCESS_KEY_ID", ""),
+        "secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", ""),
         "session_token":     os.getenv("AWS_SESSION_TOKEN", ""),
 
         # Regions to scan
